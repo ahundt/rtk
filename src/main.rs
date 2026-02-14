@@ -37,6 +37,7 @@ mod read;
 mod ruff_cmd;
 mod runner;
 mod summary;
+mod tail;
 mod tracking;
 mod tree;
 mod tsc_cmd;
@@ -85,6 +86,13 @@ enum Commands {
     /// Directory tree with token-optimized output (proxy to native tree)
     Tree {
         /// Arguments passed to tree (supports all native tree flags like -L, -d, -a)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Read end of files with token-optimized output (ANSI stripping, line numbers)
+    Tail {
+        /// Arguments passed to tail (supports all native tail flags like -n, -f, -F)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -508,6 +516,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Catch-all for unknown commands - shows helpful error
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
 }
 
 #[derive(Subcommand)]
@@ -803,6 +815,10 @@ fn main() -> Result<()> {
 
         Commands::Tree { args } => {
             tree::run(&args, cli.verbose)?;
+        }
+
+        Commands::Tail { args } => {
+            tail::run(&args, cli.verbose)?;
         }
 
         Commands::Read {
@@ -1383,6 +1399,18 @@ fn main() -> Result<()> {
             if !output.status.success() {
                 std::process::exit(output.status.code().unwrap_or(1));
             }
+        }
+
+        Commands::Unknown(args) => {
+            // Extract the unknown command name
+            let cmd_name = args.first()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<unknown>".to_string());
+
+            // One-liner error - RTK saves tokens
+            eprintln!("error: not an rtk command, see \"rtk --help\". Run and measure the command with: rtk proxy {}", cmd_name);
+
+            std::process::exit(1);
         }
     }
 
