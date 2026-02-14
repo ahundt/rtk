@@ -805,6 +805,52 @@ enum GoCommands {
     Other(Vec<OsString>),
 }
 
+/// Execute a command without filtering, tracking usage for analytics.
+/// Used by both `rtk proxy` and implicit passthrough for unknown commands.
+fn run_passthrough(args: &[OsString], verbose: u8, label: &str) -> Result<()> {
+    use std::process::Command;
+
+    let timer = tracking::TimedExecution::start();
+
+    let cmd_name = args[0].to_string_lossy();
+    let cmd_args: Vec<String> = args[1..]
+        .iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+
+    if verbose > 0 {
+        eprintln!("{}: {} {}", label, cmd_name, cmd_args.join(" "));
+    }
+
+    let output = Command::new(cmd_name.as_ref())
+        .args(&cmd_args)
+        .output()
+        .context(format!("Failed to execute command: {}", cmd_name))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let full_output = format!("{}{}", stdout, stderr);
+
+    // Print output
+    print!("{}", stdout);
+    eprint!("{}", stderr);
+
+    // Track usage (input = output since no filtering)
+    timer.track(
+        &format!("{} {}", cmd_name, cmd_args.join(" ")),
+        &format!("{} {} {}", label, cmd_name, cmd_args.join(" ")),
+        &full_output,
+        &full_output,
+    );
+
+    // Exit with same code as child process
+    if !output.status.success() {
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1354,63 +1400,34 @@ fn main() -> Result<()> {
         }
 
         Commands::Proxy { args } => {
-            use std::process::Command;
-
             if args.is_empty() {
                 anyhow::bail!(
                     "proxy requires a command to execute\nUsage: rtk proxy <command> [args...]"
                 );
             }
-
-            let timer = tracking::TimedExecution::start();
-
-            let cmd_name = args[0].to_string_lossy();
-            let cmd_args: Vec<String> = args[1..]
-                .iter()
-                .map(|s| s.to_string_lossy().into_owned())
-                .collect();
-
-            if cli.verbose > 0 {
-                eprintln!("Proxy mode: {} {}", cmd_name, cmd_args.join(" "));
-            }
-
-            let output = Command::new(cmd_name.as_ref())
-                .args(&cmd_args)
-                .output()
-                .context(format!("Failed to execute command: {}", cmd_name))?;
-
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let full_output = format!("{}{}", stdout, stderr);
-
-            // Print output
-            print!("{}", stdout);
-            eprint!("{}", stderr);
-
-            // Track usage (input = output since no filtering)
-            timer.track(
-                &format!("{} {}", cmd_name, cmd_args.join(" ")),
-                &format!("rtk proxy {} {}", cmd_name, cmd_args.join(" ")),
-                &full_output,
-                &full_output,
-            );
-
-            // Exit with same code as child process
-            if !output.status.success() {
-                std::process::exit(output.status.code().unwrap_or(1));
-            }
+            run_passthrough(&args, cli.verbose, "rtk proxy")?;
         }
 
         Commands::Unknown(args) => {
-            // Extract the unknown command name
-            let cmd_name = args.first()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "<unknown>".to_string());
+            // DESIGN DECISION: Unknown commands pass through automatically.
+            //
+            // Rationale:
+            // - AI agents learn patterns from hooks that prefix commands with "rtk"
+            // - Forcing "rtk proxy" disrupts AI workflow and wastes tokens
+            // - We collect usage data either way
+            // - Set RTK_STRICT=1 to error instead of passthrough
+            if args.is_empty() {
+                anyhow::bail!("No command provided");
+            }
 
-            // One-liner error - RTK saves tokens
-            eprintln!("error: not an rtk command, see \"rtk --help\". Run and measure the command with: rtk proxy {}", cmd_name);
+            // Strict mode: error instead of passthrough
+            if std::env::var("RTK_STRICT").is_ok_and(|v| v == "1" || v == "true") {
+                let cmd_name = args[0].to_string_lossy();
+                eprintln!("error: not an rtk command, see \"rtk --help\". Run and measure the command with: rtk proxy {}", cmd_name);
+                std::process::exit(1);
+            }
 
-            std::process::exit(1);
+            run_passthrough(&args, cli.verbose, "rtk (implicit)")?;
         }
     }
 
