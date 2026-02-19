@@ -283,68 +283,36 @@ fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
     let sub = cmd.args.first().map(String::as_str).unwrap_or("");
     let sub2 = cmd.args.get(1).map(String::as_str).unwrap_or("");
 
-    match cmd.binary.as_str() {
-        // Git: known subcommands (global options like --no-pager fall through to fallback)
-        "git"
-            if matches!(
-                sub,
-                "status"
-                    | "diff"
-                    | "log"
-                    | "add"
-                    | "commit"
-                    | "push"
-                    | "pull"
-                    | "branch"
-                    | "fetch"
-                    | "stash"
-                    | "show"
-            ) =>
-        {
+    // 1. Static routing table: O(1) lookup via HashMap (built once at startup).
+    //    Covers all simple cases: direct routes and renames (rg→grep, eslint→lint).
+    if let Some(route) = crate::routing::lookup(&cmd.binary, sub) {
+        return if route.rtk_cmd == cmd.binary.as_str() {
+            // Direct route (binary name == rtk subcommand): prepend "rtk "
             format!("rtk {raw}")
-        }
+        } else {
+            // Rename route (rg → grep, eslint → lint): replace binary prefix
+            replace_first_word(raw, &cmd.binary, &format!("rtk {}", route.rtk_cmd))
+        };
+    }
 
-        // GitHub CLI
-        "gh" if matches!(sub, "pr" | "issue" | "run") => format!("rtk {raw}"),
+    // 2. Complex cases that require Rust logic and cannot be expressed as table entries.
 
-        // Cargo: test/build/clippy/check have rtk equivalents
-        "cargo" if matches!(sub, "test" | "build" | "clippy" | "check") => format!("rtk {raw}"),
+    // cat: blocked by safety rules before reaching here; defensive for RTK_BLOCK_TOKEN_WASTE=0
+    if cmd.binary == "cat" {
+        return replace_first_word(raw, "cat", "rtk read");
+    }
 
-        // File ops — renames (rg/grep → rtk grep, cat → rtk read)
-        // NOTE: cat/head/sed are blocked by safety rules before reaching here.
-        // These arms are defensive for if RTK_BLOCK_TOKEN_WASTE=0.
-        "cat" => replace_first_word(raw, "cat", "rtk read"),
-        "grep" | "rg" => replace_first_word(raw, cmd.binary.as_str(), "rtk grep"),
-        "eslint" => replace_first_word(raw, "eslint", "rtk lint"),
-
-        // Direct prepend: rtk subcommand name = binary name
-        "ls" | "tsc" | "prettier" | "playwright" | "prisma" | "curl" | "pytest"
-        | "golangci-lint" => format!("rtk {raw}"),
-
-        // tail: may be blocked by safety (file-reading); defensive routing if allowed
-        "tail" => format!("rtk {raw}"),
-
-        // vitest: bare vitest → rtk vitest run (not rtk vitest)
+    match cmd.binary.as_str() {
+        // vitest: bare invocation → rtk vitest run (not rtk vitest)
         "vitest" if sub.is_empty() => "rtk vitest run".to_string(),
         "vitest" => format!("rtk {raw}"),
 
-        // Containers: info-read subcommands only
-        "docker" if matches!(sub, "ps" | "images" | "logs") => format!("rtk {raw}"),
-        "kubectl" if matches!(sub, "get" | "logs") => format!("rtk {raw}"),
-
-        // Go
-        "go" if matches!(sub, "test" | "build" | "vet") => format!("rtk {raw}"),
-
-        // Ruff: check/format only
-        "ruff" if matches!(sub, "check" | "format") => format!("rtk {raw}"),
-
-        // pip/uv: list/outdated/install/show only
-        "pip" if matches!(sub, "list" | "outdated" | "install" | "show") => format!("rtk {raw}"),
+        // uv pip: two-word prefix replacement
         "uv" if sub == "pip" && matches!(sub2, "list" | "outdated" | "install" | "show") => {
             replace_first_word(raw, "uv pip", "rtk pip")
         }
 
-        // python/python3 -m pytest
+        // python/python3 -m pytest: two-arg prefix replacement
         "python" | "python3" if sub == "-m" && sub2 == "pytest" => {
             let prefix = format!("{} -m pytest", cmd.binary);
             replace_first_word(raw, &prefix, "rtk pytest")
