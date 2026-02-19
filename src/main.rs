@@ -36,6 +36,7 @@ mod prettier_cmd;
 mod prisma_cmd;
 mod pytest_cmd;
 mod read;
+mod routing;
 mod ruff_cmd;
 mod runner;
 mod summary;
