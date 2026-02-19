@@ -110,8 +110,13 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
                 }
             }
 
-            // All safe - wrap in rtk run for token optimization
-            HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)))
+            // Single command: route to optimized RTK subcommand.
+            // Chained commands (&&, ||, ;): wrap entire chain in rtk run -c.
+            if commands.len() == 1 {
+                HookResult::Rewrite(route_native_command(&commands[0], raw))
+            } else {
+                HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)))
+            }
         }
         Err(_) => {
             // Parse error - passthrough with wrapping
@@ -183,6 +188,175 @@ pub enum HookResponse {
 /// Escape single quotes for shell
 fn escape_quotes(s: &str) -> String {
     s.replace("'", "'\\''")
+}
+
+/// Replace the first occurrence of `old_prefix` in `raw` with `new_prefix`.
+///
+/// Preserves everything after the prefix (including original quoting).
+/// Falls back to `rtk run -c '<raw>'` if prefix not found (safe degradation).
+///
+/// # Examples
+/// - `replace_first_word("grep -r p src/", "grep", "rtk grep")` → `"rtk grep -r p src/"`
+/// - `replace_first_word("rg pattern", "rg", "rtk grep")` → `"rtk grep pattern"`
+fn replace_first_word(raw: &str, old_prefix: &str, new_prefix: &str) -> String {
+    raw.strip_prefix(old_prefix)
+        .map(|rest| format!("{new_prefix}{rest}"))
+        .unwrap_or_else(|| format!("rtk run -c '{}'", escape_quotes(raw)))
+}
+
+/// Route pnpm subcommands to RTK equivalents.
+///
+/// Uses `cmd.args` (parsed, quote-stripped) for routing decisions.
+/// Uses `raw` or reconstructed args for output to preserve original quoting.
+fn route_pnpm(cmd: &analysis::NativeCommand, raw: &str) -> String {
+    let sub = cmd.args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "list" | "ls" | "outdated" | "install" => format!("rtk {raw}"),
+
+        // pnpm vitest [run] [flags] → rtk vitest run [flags]
+        // Shell script sed bug: 's/^(pnpm )?vitest/rtk vitest run/' on
+        // "pnpm vitest run --coverage" produces "rtk vitest run run --coverage".
+        // Binary hook corrects this by stripping the leading "run" from parsed args.
+        "vitest" => {
+            let after_vitest: Vec<&str> = cmd.args[1..]
+                .iter()
+                .map(String::as_str)
+                .skip_while(|&a| a == "run")
+                .collect();
+            if after_vitest.is_empty() {
+                "rtk vitest run".to_string()
+            } else {
+                format!("rtk vitest run {}", after_vitest.join(" "))
+            }
+        }
+
+        // pnpm test [flags] → rtk vitest run [flags]
+        "test" => {
+            let after_test: Vec<&str> = cmd.args[1..].iter().map(String::as_str).collect();
+            if after_test.is_empty() {
+                "rtk vitest run".to_string()
+            } else {
+                format!("rtk vitest run {}", after_test.join(" "))
+            }
+        }
+
+        "tsc" => replace_first_word(raw, "pnpm tsc", "rtk tsc"),
+        "lint" => replace_first_word(raw, "pnpm lint", "rtk lint"),
+        "playwright" => replace_first_word(raw, "pnpm playwright", "rtk playwright"),
+
+        _ => format!("rtk run -c '{}'", escape_quotes(raw)),
+    }
+}
+
+/// Route npx subcommands to RTK equivalents.
+fn route_npx(cmd: &analysis::NativeCommand, raw: &str) -> String {
+    let sub = cmd.args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "tsc" | "typescript" => replace_first_word(raw, &format!("npx {sub}"), "rtk tsc"),
+        "eslint" => replace_first_word(raw, "npx eslint", "rtk lint"),
+        "prettier" => replace_first_word(raw, "npx prettier", "rtk prettier"),
+        "playwright" => replace_first_word(raw, "npx playwright", "rtk playwright"),
+        "prisma" => replace_first_word(raw, "npx prisma", "rtk prisma"),
+        _ => format!("rtk run -c '{}'", escape_quotes(raw)),
+    }
+}
+
+/// Route a single parsed native command to its optimized RTK subcommand.
+///
+/// ## Design
+/// - Uses `cmd.binary`/`cmd.args` (lexer→parse_chain output) for routing DECISIONS.
+/// - Uses `raw: &str` with `replace_first_word` for string REPLACEMENT (preserves quoting).
+/// - `format!("rtk {raw}")` works when the binary name equals the RTK subcommand.
+/// - `replace_first_word` handles renames: `rg → rtk grep`, `cat → rtk read`.
+///
+/// ## Fallback
+/// Unknown binaries or unrecognized subcommands → `rtk run -c '<raw>'` (safe passthrough).
+///
+/// ## Mirrors
+/// `~/.claude/hooks/rtk-rewrite.sh` routing table. Corrects the shell script's
+/// `vitest run` double-"run" bug by using parsed args rather than regex substitution.
+///
+/// ## Safety interaction
+/// `safety::check` runs BEFORE this function. Blocked commands (cat, head, sed)
+/// never reach here. The `cat` arm is defensive for when `RTK_BLOCK_TOKEN_WASTE=0`.
+fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
+    let sub = cmd.args.first().map(String::as_str).unwrap_or("");
+    let sub2 = cmd.args.get(1).map(String::as_str).unwrap_or("");
+
+    match cmd.binary.as_str() {
+        // Git: known subcommands (global options like --no-pager fall through to fallback)
+        "git"
+            if matches!(
+                sub,
+                "status"
+                    | "diff"
+                    | "log"
+                    | "add"
+                    | "commit"
+                    | "push"
+                    | "pull"
+                    | "branch"
+                    | "fetch"
+                    | "stash"
+                    | "show"
+            ) =>
+        {
+            format!("rtk {raw}")
+        }
+
+        // GitHub CLI
+        "gh" if matches!(sub, "pr" | "issue" | "run") => format!("rtk {raw}"),
+
+        // Cargo: test/build/clippy/check have rtk equivalents
+        "cargo" if matches!(sub, "test" | "build" | "clippy" | "check") => format!("rtk {raw}"),
+
+        // File ops — renames (rg/grep → rtk grep, cat → rtk read)
+        // NOTE: cat/head/sed are blocked by safety rules before reaching here.
+        // These arms are defensive for if RTK_BLOCK_TOKEN_WASTE=0.
+        "cat" => replace_first_word(raw, "cat", "rtk read"),
+        "grep" | "rg" => replace_first_word(raw, cmd.binary.as_str(), "rtk grep"),
+        "eslint" => replace_first_word(raw, "eslint", "rtk lint"),
+
+        // Direct prepend: rtk subcommand name = binary name
+        "ls" | "tsc" | "prettier" | "playwright" | "prisma" | "curl" | "pytest"
+        | "golangci-lint" => format!("rtk {raw}"),
+
+        // tail: may be blocked by safety (file-reading); defensive routing if allowed
+        "tail" => format!("rtk {raw}"),
+
+        // vitest: bare vitest → rtk vitest run (not rtk vitest)
+        "vitest" if sub.is_empty() => "rtk vitest run".to_string(),
+        "vitest" => format!("rtk {raw}"),
+
+        // Containers: info-read subcommands only
+        "docker" if matches!(sub, "ps" | "images" | "logs") => format!("rtk {raw}"),
+        "kubectl" if matches!(sub, "get" | "logs") => format!("rtk {raw}"),
+
+        // Go
+        "go" if matches!(sub, "test" | "build" | "vet") => format!("rtk {raw}"),
+
+        // Ruff: check/format only
+        "ruff" if matches!(sub, "check" | "format") => format!("rtk {raw}"),
+
+        // pip/uv: list/outdated/install/show only
+        "pip" if matches!(sub, "list" | "outdated" | "install" | "show") => format!("rtk {raw}"),
+        "uv" if sub == "pip" && matches!(sub2, "list" | "outdated" | "install" | "show") => {
+            replace_first_word(raw, "uv pip", "rtk pip")
+        }
+
+        // python/python3 -m pytest
+        "python" | "python3" if sub == "-m" && sub2 == "pytest" => {
+            let prefix = format!("{} -m pytest", cmd.binary);
+            replace_first_word(raw, &prefix, "rtk pytest")
+        }
+
+        // pnpm / npx: delegated to helpers (complex sub-routing)
+        "pnpm" => route_pnpm(cmd, raw),
+        "npx" => route_npx(cmd, raw),
+
+        // Fallback: unknown binary or unrecognized subcommand
+        _ => format!("rtk run -c '{}'", escape_quotes(raw)),
+    }
 }
 
 /// Format hook result for Claude (text output)
@@ -257,16 +431,16 @@ mod tests {
     #[test]
     fn test_safe_commands_rewrite() {
         let cases = [
-            ("git status", "rtk run"),
-            ("ls *.rs", "rtk run"), // shellism passthrough
-            (r#"git commit -m "Fix && Bug""#, "rtk run"), // quoted operator
-            ("FOO=bar echo hello", "rtk run"), // env prefix
-            ("echo `date`", "rtk run"), // backticks
-            ("echo $(date)", "rtk run"), // subshell
-            ("echo {a,b}.txt", "rtk run"), // brace expansion
+            ("git status", "rtk git status"), // now routes to optimized subcommand
+            ("ls *.rs", "rtk run"),           // shellism passthrough (glob)
+            (r#"git commit -m "Fix && Bug""#, "rtk git commit"), // quoted &&: single cmd, routes
+            ("FOO=bar echo hello", "rtk run"), // env prefix → shellism
+            ("echo `date`", "rtk run"),       // backticks → shellism
+            ("echo $(date)", "rtk run"),      // subshell → shellism
+            ("echo {a,b}.txt", "rtk run"),    // brace expansion → shellism
             ("echo 'hello!@#$%^&*()'", "rtk run"), // special chars
-            ("echo '日本語 🎉'", "rtk run"), // unicode
-            ("cd /tmp && git status", "rtk run"), // chain rewrite
+            ("echo '日本語 🎉'", "rtk run"),  // unicode
+            ("cd /tmp && git status", "rtk run"), // chain → rtk run -c
         ];
         for (input, expected) in cases {
             assert_rewrite(input, expected);
@@ -381,7 +555,13 @@ mod tests {
             "rg pattern src/",
         ];
         for input in cases {
-            assert_rewrite(input, "rtk run");
+            // Test name intent: commands must Rewrite (not Blocked), regardless of routing target.
+            // Specific routing targets are verified in test_routing_native_commands.
+            assert!(
+                matches!(check_for_hook(input, "claude"), HookResult::Rewrite(_)),
+                "'{}' should Rewrite (not Blocked)",
+                input
+            );
         }
     }
 
@@ -451,11 +631,16 @@ mod tests {
 
     #[test]
     fn test_compound_quoted_operators_not_split() {
-        // && inside quotes must NOT split the command
+        // && inside quotes must NOT split the command into a chain.
+        // parse_chain sees one command: git commit with args ["-m", "Fix && Bug"].
+        // That single command routes to rtk git commit (not rtk run -c).
         let input = r#"git commit -m "Fix && Bug""#;
         match check_for_hook(input, "claude") {
             HookResult::Rewrite(cmd) => {
-                assert!(cmd.contains("rtk run"), "Should rewrite, got '{cmd}'");
+                assert!(
+                    cmd.contains("rtk git commit"),
+                    "Quoted && must not split; should route to rtk git commit, got '{cmd}'"
+                );
             }
             other => panic!("Expected Rewrite for quoted &&, got {other:?}"),
         }
@@ -496,10 +681,12 @@ mod tests {
 
     #[test]
     fn test_different_agents_same_result() {
+        // Both agents must Rewrite (not Block) safe commands.
+        // Specific routing targets verified in test_cross_agent_routing_identical.
         for agent in ["claude", "gemini"] {
             match check_for_hook("git status", agent) {
-                HookResult::Rewrite(cmd) => assert!(cmd.contains("rtk run")),
-                _ => panic!("Expected Rewrite for agent '{}'", agent),
+                HookResult::Rewrite(_) => {}
+                other => panic!("Expected Rewrite for agent '{}', got {:?}", agent, other),
             }
         }
     }
@@ -649,6 +836,107 @@ mod tests {
                 _ => panic!(
                     "'{}': Claude={:?}, Gemini={:?} — both should Block",
                     cmd, claude, gemini
+                ),
+            }
+        }
+    }
+
+    // =====================================================================
+    // ROUTING TESTS — verify route_native_command dispatch
+    // =====================================================================
+
+    #[test]
+    fn test_routing_native_commands() {
+        // Table-driven: commands that route to optimized rtk subcommands.
+        // Each (input, expected_substr) must appear in the rewritten output.
+        let cases = [
+            // Git: known subcommands
+            ("git status", "rtk git status"),
+            ("git log --oneline -10", "rtk git log --oneline -10"),
+            ("git diff HEAD", "rtk git diff HEAD"),
+            ("git add .", "rtk git add ."),
+            ("git commit -m msg", "rtk git commit"),
+            // GitHub CLI
+            ("gh pr view 156", "rtk gh pr view 156"),
+            // Cargo
+            ("cargo test", "rtk cargo test"),
+            (
+                "cargo clippy --all-targets",
+                "rtk cargo clippy --all-targets",
+            ),
+            // File ops (rg → rtk grep rename)
+            // NOTE: cat is blocked by safety before reaching router; arm is defensive.
+            ("grep -r pattern src/", "rtk grep -r pattern src/"),
+            ("rg pattern src/", "rtk grep pattern src/"),
+            ("ls -la", "rtk ls -la"),
+            ("tail -n 20 file.txt", "rtk tail -n 20 file.txt"),
+            // JS/TS tooling
+            ("vitest", "rtk vitest run"),     // bare → rtk vitest run
+            ("vitest run", "rtk vitest run"), // explicit run preserved
+            ("vitest run --coverage", "rtk vitest run --coverage"),
+            ("pnpm test", "rtk vitest run"),
+            ("pnpm vitest", "rtk vitest run"),
+            ("pnpm lint", "rtk lint"),
+            ("npx tsc --noEmit", "rtk tsc --noEmit"),
+            // Python
+            ("python -m pytest tests/", "rtk pytest tests/"),
+            ("uv pip list", "rtk pip list"),
+            // Go
+            ("go test ./...", "rtk go test ./..."),
+        ];
+        for (input, expected) in cases {
+            assert_rewrite(input, expected);
+        }
+    }
+
+    #[test]
+    fn test_routing_vitest_no_double_run() {
+        // Shell script sed bug: 's/^(pnpm )?vitest/rtk vitest run/' on
+        // "pnpm vitest run --coverage" produces "rtk vitest run run --coverage".
+        // Binary hook corrects this by using parsed args instead of regex substitution.
+        let result = match check_for_hook("pnpm vitest run --coverage", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert_rewrite("pnpm vitest run --coverage", "rtk vitest run --coverage");
+        assert!(
+            !result.contains("run run"),
+            "Must not double 'run' in output: '{}'",
+            result
+        );
+    }
+
+    #[test]
+    fn test_routing_fallbacks_to_rtk_run() {
+        // Unknown subcommand, chains (2+ cmds), and pipes fall back to rtk run -c.
+        let cases = [
+            "git checkout main",              // unknown git subcommand
+            "git add . && git commit -m msg", // chain → 2 commands → rtk run -c
+            "git log | grep fix",             // pipe → needs_shell → rtk run -c
+        ];
+        for input in cases {
+            assert_rewrite(input, "rtk run -c");
+        }
+    }
+
+    #[test]
+    fn test_cross_agent_routing_identical() {
+        // Both claude and gemini must route the same commands to the same output.
+        for cmd in ["git status", "cargo test", "ls -la"] {
+            let claude_result = check_for_hook(cmd, "claude");
+            let gemini_result = check_for_hook(cmd, "gemini");
+            match (&claude_result, &gemini_result) {
+                (HookResult::Rewrite(c), HookResult::Rewrite(g)) => {
+                    assert_eq!(c, g, "claude and gemini must route '{}' identically", cmd);
+                    assert!(
+                        !c.contains("rtk run -c"),
+                        "'{}' should not fall back to rtk run -c",
+                        cmd
+                    );
+                }
+                _ => panic!(
+                    "'{}' should Rewrite for both agents: claude={:?} gemini={:?}",
+                    cmd, claude_result, gemini_result
                 ),
             }
         }
