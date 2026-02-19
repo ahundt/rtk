@@ -837,7 +837,6 @@ mod tests {
             ("grep -r pattern src/", "rtk grep -r pattern src/"),
             ("rg pattern src/", "rtk grep pattern src/"),
             ("ls -la", "rtk ls -la"),
-            ("tail -n 20 file.txt", "rtk tail -n 20 file.txt"),
             // JS/TS tooling
             ("vitest", "rtk vitest run"),     // bare → rtk vitest run
             ("vitest run", "rtk vitest run"), // explicit run preserved
@@ -854,13 +853,16 @@ mod tests {
             ("go build ./...", "rtk go build ./..."),
             ("go vet ./...", "rtk go vet ./..."),
             // All ROUTES entries not yet covered above
-            ("eslint src/", "rtk lint src/"),           // rename: eslint → lint
-            ("tsc --noEmit", "rtk tsc --noEmit"),        // bare tsc (not npx tsc)
+            ("eslint src/", "rtk lint src/"), // rename: eslint → lint
+            ("tsc --noEmit", "rtk tsc --noEmit"), // bare tsc (not npx tsc)
             ("prettier src/", "rtk prettier src/"),
             ("playwright test", "rtk playwright test"),
             ("prisma migrate dev", "rtk prisma migrate dev"),
-            ("curl https://api.example.com", "rtk curl https://api.example.com"),
-            ("pytest tests/", "rtk pytest tests/"),      // bare pytest (not python -m pytest)
+            (
+                "curl https://api.example.com",
+                "rtk curl https://api.example.com",
+            ),
+            ("pytest tests/", "rtk pytest tests/"), // bare pytest (not python -m pytest)
             ("pytest -x tests/unit", "rtk pytest -x tests/unit"),
             ("golangci-lint run ./...", "rtk golangci-lint run ./..."),
             ("docker ps", "rtk docker ps"),
@@ -889,20 +891,20 @@ mod tests {
         // Commands where binary is in ROUTES but subcommand is NOT in the Only list
         // must fall through to `rtk run -c '...'`.
         let cases = [
-            "docker build .",           // docker Only: ps, images, logs
-            "docker run -it nginx",     // docker Only: ps, images, logs
+            "docker build .",            // docker Only: ps, images, logs
+            "docker run -it nginx",      // docker Only: ps, images, logs
             "kubectl apply -f dep.yaml", // kubectl Only: get, logs
-            "kubectl delete pod mypod", // kubectl Only: get, logs
-            "go mod tidy",              // go Only: test, build, vet
-            "go generate ./...",        // go Only: test, build, vet
-            "ruff lint src/",           // ruff Only: check, format
-            "pip freeze",               // pip Only: list, outdated, install, show
-            "pip uninstall requests",   // pip Only: list, outdated, install, show
-            "cargo publish",            // cargo Only: test, build, clippy, check
-            "cargo run",                // cargo Only: test, build, clippy, check
-            "git rebase -i HEAD~3",     // git Only list (rebase not included)
-            "git cherry-pick abc123",   // git Only list
-            "gh repo clone foo/bar",    // gh Only: pr, issue, run
+            "kubectl delete pod mypod",  // kubectl Only: get, logs
+            "go mod tidy",               // go Only: test, build, vet
+            "go generate ./...",         // go Only: test, build, vet
+            "ruff lint src/",            // ruff Only: check, format
+            "pip freeze",                // pip Only: list, outdated, install, show
+            "pip uninstall requests",    // pip Only: list, outdated, install, show
+            "cargo publish",             // cargo Only: test, build, clippy, check
+            "cargo run",                 // cargo Only: test, build, clippy, check
+            "git rebase -i HEAD~3",      // git Only list (rebase not included)
+            "git cherry-pick abc123",    // git Only list
+            "gh repo clone foo/bar",     // gh Only: pr, issue, run
         ];
         for input in cases {
             assert_rewrite(input, "rtk run -c");
@@ -928,11 +930,14 @@ mod tests {
 
     #[test]
     fn test_routing_fallbacks_to_rtk_run() {
-        // Unknown subcommand, chains (2+ cmds), and pipes fall back to rtk run -c.
+        // Unknown subcommand, chains (2+ cmds), pipes, and binaries with no rtk
+        // equivalent fall back to rtk run -c.
         let cases = [
             "git checkout main",              // unknown git subcommand
             "git add . && git commit -m msg", // chain → 2 commands → rtk run -c
             "git log | grep fix",             // pipe → needs_shell → rtk run -c
+            "tail -n 20 file.txt",            // no rtk tail subcommand exists
+            "tail -f server.log",             // no rtk tail subcommand exists
         ];
         for input in cases {
             assert_rewrite(input, "rtk run -c");

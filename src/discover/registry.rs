@@ -120,12 +120,6 @@ pub const ROUTES: &[Route] = &[
         subcmds: Subcmds::Any,
         rtk_cmd: "pytest",
     },
-    // Log tailing
-    Route {
-        binaries: &["tail"],
-        subcmds: Subcmds::Any,
-        rtk_cmd: "tail",
-    },
     // Go linting
     Route {
         binaries: &["golangci-lint"],
@@ -268,6 +262,12 @@ const PATTERNS: &[&str] = &[
     r"^kubectl\s+(get|logs)",
     r"^curl\s+",
     r"^wget\s+",
+    // Python/Go tooling (added with Python & Go support)
+    r"^pytest(\s|$)",
+    r"^go\s+(test|build|vet)(\s|$)",
+    r"^ruff\s+(check|format)(\s|$)",
+    r"^(pip|pip3)\s+(list|outdated|install|show)(\s|$)",
+    r"^golangci-lint(\s|$)",
 ];
 
 const RULES: &[RtkRule] = &[
@@ -420,6 +420,42 @@ const RULES: &[RtkRule] = &[
         rtk_cmd: "rtk wget",
         category: "Network",
         savings_pct: 65.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    // Python/Go tooling (added with Python & Go support)
+    RtkRule {
+        rtk_cmd: "rtk pytest",
+        category: "Tests",
+        savings_pct: 90.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk go",
+        category: "Build",
+        savings_pct: 85.0,
+        subcmd_savings: &[("test", 90.0)],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk ruff",
+        category: "Build",
+        savings_pct: 80.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk pip",
+        category: "PackageManager",
+        savings_pct: 75.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
+    RtkRule {
+        rtk_cmd: "rtk golangci-lint",
+        category: "Build",
+        savings_pct: 85.0,
         subcmd_savings: &[],
         subcmd_status: &[],
     },
@@ -858,6 +894,129 @@ mod tests {
                 status: RtkStatus::Existing,
             }
         );
+    }
+
+    // --- Tests for commands added in Python/Go support (must be in both ROUTES and PATTERNS) ---
+
+    #[test]
+    fn test_classify_pytest_bare() {
+        match classify_command("pytest tests/") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk pytest")
+            }
+            other => panic!("pytest should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_pytest_flags() {
+        match classify_command("pytest -x tests/unit") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk pytest")
+            }
+            other => panic!("pytest -x should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_go_test() {
+        match classify_command("go test ./...") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk go")
+            }
+            other => panic!("go test should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_go_build() {
+        match classify_command("go build ./...") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk go")
+            }
+            other => panic!("go build should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_go_vet() {
+        match classify_command("go vet ./...") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk go")
+            }
+            other => panic!("go vet should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_go_unsupported_subcommand_not_matched() {
+        // go mod tidy is not in the Only list; should not be classified as rtk go
+        match classify_command("go mod tidy") {
+            Classification::Unsupported { .. } | Classification::Ignored => {}
+            Classification::Supported { rtk_equivalent, .. } => {
+                panic!("go mod should not match, but got rtk_equivalent={rtk_equivalent}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_classify_ruff_check() {
+        match classify_command("ruff check src/") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk ruff")
+            }
+            other => panic!("ruff check should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_ruff_format() {
+        match classify_command("ruff format src/") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk ruff")
+            }
+            other => panic!("ruff format should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_pip_list() {
+        match classify_command("pip list") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk pip")
+            }
+            other => panic!("pip list should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_pip_install() {
+        match classify_command("pip install requests") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk pip")
+            }
+            other => panic!("pip install should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_pip3_list() {
+        match classify_command("pip3 list") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk pip")
+            }
+            other => panic!("pip3 list should be Supported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_golangci_lint() {
+        match classify_command("golangci-lint run ./...") {
+            Classification::Supported { rtk_equivalent, .. } => {
+                assert_eq!(rtk_equivalent, "rtk golangci-lint")
+            }
+            other => panic!("golangci-lint should be Supported, got {other:?}"),
+        }
     }
 
     #[test]
