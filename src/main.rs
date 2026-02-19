@@ -859,7 +859,7 @@ enum HookCommands {
         #[arg(long, default_value = "claude")]
         agent: String,
         /// Command to check
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
     /// Handle Claude Code JSON hook protocol (reads from stdin)
@@ -1626,8 +1626,8 @@ fn main() -> Result<()> {
                     println!("{}", output);
                 } else {
                     eprintln!("{}", output);
+                    std::process::exit(code);
                 }
-                std::process::exit(code);
             }
             HookCommands::Claude => {
                 cmd::claude_hook::run()?;
