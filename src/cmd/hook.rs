@@ -285,7 +285,7 @@ fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
 
     // 1. Static routing table: O(1) lookup via HashMap (built once at startup).
     //    Covers all simple cases: direct routes and renames (rg→grep, eslint→lint).
-    if let Some(route) = crate::routing::lookup(&cmd.binary, sub) {
+    if let Some(route) = crate::discover::registry::lookup(&cmd.binary, sub) {
         return if route.rtk_cmd == cmd.binary.as_str() {
             // Direct route (binary name == rtk subcommand): prepend "rtk "
             format!("rtk {raw}")
