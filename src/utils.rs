@@ -45,6 +45,10 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 /// assert_eq!(strip_ansi(colored), "Error");
 /// ```
 pub fn strip_ansi(text: &str) -> String {
+    // TODO: replace this regex with the `strip-ansi-escapes` crate for complete coverage.
+    // Current pattern only handles CSI sequences (ESC [ digits/semicolons letter).
+    // Missed: OSC sequences (ESC ] ... BEL/ST), private-mode params (e.g. ESC [?25h),
+    // and simple two-byte ESC sequences (ESC M, ESC 7, etc.).
     lazy_static::lazy_static! {
         static ref ANSI_RE: Regex = Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").unwrap();
     }
