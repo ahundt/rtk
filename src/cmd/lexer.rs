@@ -400,20 +400,78 @@ mod tests {
         assert!(!tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)));
     }
 
+    // === $VAR HANDLING TESTS ===
+    // Simple $IDENT forms are Arg (shell expands at execution time when running
+    // the rewritten "rtk cmd $VAR" command).  Complex forms ($(), ${}, $?, $$,
+    // $!, $0–$9) remain Shellism and force passthrough to the real shell.
+
     #[test]
-    fn test_variable_detection() {
-        // After the $VAR-as-Arg fix, simple $IDENT is now TokenKind::Arg, not Shellism.
-        // The shell expands the variable when running the rewritten "rtk echo $HOME".
+    fn test_simple_var_is_arg() {
+        // $HOME after space → Arg("$HOME"), NOT Shellism.
+        // The shell expands it when executing the rewritten "rtk cmd $HOME" — RTK does not.
         let tokens = tokenize("echo $HOME");
         assert!(
             tokens
                 .iter()
                 .any(|t| matches!(t.kind, TokenKind::Arg) && t.value == "$HOME"),
-            "Simple $VAR must now be Arg — shell expands at execution time"
+            "Simple $VAR must be Arg, not Shellism — shell expands at execution time"
         );
         assert!(
             !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "No Shellism expected for simple $VAR after lexer fix"
+            "No Shellism token expected for simple $VAR"
+        );
+    }
+
+    #[test]
+    fn test_simple_var_enables_native_routing() {
+        // git log $BRANCH: no Shellism → needs_shell()=false → can route to rtk git
+        let tokens = tokenize("git log $BRANCH");
+        assert!(
+            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "git log $BRANCH must have no Shellism — simple $VAR is Arg, not Shellism"
+        );
+    }
+
+    #[test]
+    fn test_dollar_subshell_stays_shellism() {
+        // $() needs real shell for command substitution
+        let tokens = tokenize("echo $(date)");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "$(cmd) must produce Shellism — command substitution needs shell"
+        );
+    }
+
+    #[test]
+    fn test_dollar_brace_stays_shellism() {
+        // ${VAR} needs real shell (complex expansion / parameter substitution)
+        let tokens = tokenize("echo ${HOME}");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "${{VAR}} must produce Shellism — brace expansion needs shell"
+        );
+    }
+
+    #[test]
+    fn test_dollar_special_vars_stay_shellism() {
+        // $? $$ $! are special variables — not simple identifiers
+        for s in &["echo $?", "echo $$", "echo $!"] {
+            let tokens = tokenize(s);
+            assert!(
+                tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+                "{} should produce Shellism — special var needs shell",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn test_dollar_digit_stays_shellism() {
+        // $0–$9 are positional parameters — leave to shell
+        let tokens = tokenize("echo $1");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "$1 (positional parameter) must be Shellism — handled by shell"
         );
     }
 
@@ -611,74 +669,6 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t.kind, TokenKind::Shellism) && t.value == "&"),
             "Single & (background job) must be Shellism, not Redirect"
-        );
-    } // === $VAR AS ARG TESTS ===
-      // Simple $IDENT forms are Arg (shell expands at execution time when running
-      // the rewritten "rtk cmd $VAR").  Complex forms ($(), ${}, $?, $$, $!, $0-$9)
-      // remain Shellism — they require real shell expansion before execution.
-
-    #[test]
-    fn test_simple_var_is_arg() {
-        // $HOME after space → Arg("$HOME"), NOT Shellism.
-        let tokens = tokenize("git log $HOME");
-        assert!(
-            tokens
-                .iter()
-                .any(|t| matches!(t.kind, TokenKind::Arg) && t.value == "$HOME"),
-            "Simple $VAR must be Arg, not Shellism — shell expands at execution time"
-        );
-        assert!(
-            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "No Shellism tokens expected for simple $VAR commands"
-        );
-    }
-
-    #[test]
-    fn test_simple_var_enables_native_routing() {
-        let tokens = tokenize("git log $BRANCH");
-        assert!(
-            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "git log $BRANCH must have no Shellism — simple $VAR is Arg, not Shellism"
-        );
-    }
-
-    #[test]
-    fn test_dollar_subshell_stays_shellism() {
-        // $(...) subshell: the '(' is a Shellism
-        let tokens = tokenize("echo $(date)");
-        assert!(
-            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "$(...) must produce Shellism — subshell requires real shell"
-        );
-    }
-
-    #[test]
-    fn test_dollar_brace_stays_shellism() {
-        // ${VAR} parameter expansion: the '{' is a Shellism
-        let tokens = tokenize("echo ${HOME}");
-        assert!(
-            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "${{VAR}} must produce Shellism — brace expansion requires real shell"
-        );
-    }
-
-    #[test]
-    fn test_dollar_special_vars_stay_shellism() {
-        // $? (last exit code) — bare $ followed by '?' → Shellism
-        let tokens = tokenize("echo $?");
-        assert!(
-            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "$? must be Shellism — special variable requires real shell"
-        );
-    }
-
-    #[test]
-    fn test_dollar_digit_stays_shellism() {
-        // $1 positional arg — bare $ followed by digit → Shellism
-        let tokens = tokenize("echo $1");
-        assert!(
-            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
-            "$1 must be Shellism — positional variable requires real shell"
         );
     }
 }
