@@ -372,7 +372,7 @@ fn run_log(args: &[String], _max_lines: Option<usize>, verbose: u8) -> Result<()
 }
 
 /// Filter git log output: truncate long messages, cap lines
-fn filter_log_output(output: &str, limit: usize) -> String {
+pub(crate) fn filter_log_output(output: &str, limit: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let capped: Vec<String> = lines
         .iter()
@@ -391,7 +391,7 @@ fn filter_log_output(output: &str, limit: usize) -> String {
 }
 
 /// Format porcelain output into compact RTK status display
-fn format_status_output(porcelain: &str) -> String {
+pub(crate) fn format_status_output(porcelain: &str) -> String {
     let lines: Vec<&str> = porcelain.lines().collect();
 
     if lines.is_empty() {

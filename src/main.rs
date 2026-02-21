@@ -31,6 +31,7 @@ mod next_cmd;
 mod npm_cmd;
 mod parser;
 mod pip_cmd;
+mod pipe_cmd;
 mod playwright_cmd;
 mod pnpm_cmd;
 mod prettier_cmd;
@@ -39,6 +40,7 @@ mod pytest_cmd;
 mod read;
 mod ruff_cmd;
 mod runner;
+mod stream;
 mod summary;
 mod tee;
 mod tracking;
@@ -95,6 +97,11 @@ struct Cli {
     /// Can be specified multiple times: --rules-add dir1 --rules-add dir2
     #[arg(long = "rules-add", global = true)]
     rules_add: Vec<std::path::PathBuf>,
+
+    /// Bypass RTK token filtering: emit raw subprocess output unchanged.
+    /// Useful for debugging filters or when full output is needed.
+    #[arg(long = "passthrough", global = true)]
+    passthrough: bool,
 }
 
 #[derive(Subcommand)]
@@ -506,6 +513,18 @@ enum Commands {
         /// Minimum occurrences to include in report
         #[arg(long, default_value = "1")]
         min_occurrences: usize,
+    },
+
+    /// Read stdin and apply token-reduction filter (pipe-as-filter mode)
+    Pipe {
+        /// Filter to apply (auto-detected if omitted): cargo-test, pytest, go-test,
+        /// go-build, tsc, vitest, grep, rg, git-log, git-diff, git-status
+        #[arg(short, long)]
+        filter: Option<String>,
+
+        /// Passthrough: emit stdin unchanged (for debugging or future use)
+        #[arg(long)]
+        passthrough: bool,
     },
 
     /// Execute command without filtering but track usage
@@ -1624,10 +1643,17 @@ fn main() -> Result<()> {
             }
         }
 
+        Commands::Pipe {
+            filter,
+            passthrough,
+        } => {
+            pipe_cmd::run(filter.as_deref(), passthrough)?;
+        }
+
         Commands::Run { command } => {
-            let success = cmd::execute(&command, cli.verbose)?;
-            if !success {
-                std::process::exit(1);
+            let code = cmd::execute(&command, cli.verbose)?;
+            if code != 0 {
+                std::process::exit(code);
             }
         }
 
