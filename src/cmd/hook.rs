@@ -231,7 +231,11 @@ pub enum HookResponse {
     Deny(String, String),
 }
 
-/// Commands whose RTK output format is identical to the raw command output.
+/// Commands whose RTK output format matches their raw output, making them
+/// safe as the left side of any pipe.
+///
+/// For a command to be format-preserving, RTK must emit the same logical
+/// lines as the underlying tool — just possibly with ANSI codes stripped.
 ///
 /// These can be substituted on the left of a pipe without breaking the
 /// right-side consumer.
@@ -1496,6 +1500,79 @@ mod tests {
         );
     }
 
+    // === PIPE OUTPUT CLASSIFICATION TESTS ===
+    // FORMAT_PRESERVING: commands whose RTK output format matches raw output,
+    //   making them safe as the left side of any pipe.
+    // TRANSPARENT_SINKS: right-side commands that consume any input format
+    //   (already handled by split_safe_suffix for routing purposes).
+    //
+    // These classification constants document the safety policy for future
+    // pipe-left substitution logic and must contain the expected entries.
+
+    #[test]
+    fn test_format_preserving_contains_expected() {
+        assert!(
+            FORMAT_PRESERVING.contains(&"tail"),
+            "tail is format-preserving (line-per-line passthrough)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"echo"),
+            "echo is format-preserving (output equals input)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"find"),
+            "find is format-preserving (path-per-line)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"cat"),
+            "cat is format-preserving (byte passthrough)"
+        );
+    }
+
+    #[test]
+    fn test_format_changing_not_in_format_preserving() {
+        // Commands that transform output heavily must NOT be in FORMAT_PRESERVING.
+        // If substituted as left side of a semantic-sink pipe (grep, jq, awk),
+        // the right side would receive unexpected compressed format and break.
+        assert!(
+            !FORMAT_PRESERVING.contains(&"cargo"),
+            "cargo test compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"git"),
+            "git log/diff compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"pytest"),
+            "pytest compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"go"),
+            "go test compresses output — not format-preserving"
+        );
+    }
+
+    #[test]
+    fn test_transparent_sinks_contains_expected() {
+        // Transparent sinks accept any input format — already handled by split_safe_suffix.
+        assert!(
+            TRANSPARENT_SINKS.contains(&"tee"),
+            "tee is a transparent sink (copies stdin to file + stdout)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"head"),
+            "head is a transparent sink (truncates lines)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"cat"),
+            "cat is a transparent sink (passes through)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"tail"),
+            "tail is a transparent sink (last N lines)"
+        );
+    }
+
     // ── End-to-end token savings tests ───────────────────────────────────────
     // These tests simulate the full hook pipeline from the start:
     //   raw command → check_for_hook (lexer + router) → rewritten rtk cmd
@@ -1607,79 +1684,6 @@ mod tests {
             ratio <= 1.05,
             "rtk git log must not significantly bloat output vs raw git log \
              ({raw_tok} raw → {rtk_tok} rtk, ratio {ratio:.2})"
-        );
-    }
-
-    // === PIPE OUTPUT CLASSIFICATION TESTS ===
-    // FORMAT_PRESERVING: commands whose RTK output format matches raw output,
-    //   making them safe as the left side of any pipe.
-    // TRANSPARENT_SINKS: right-side commands that consume any input format
-    //   (already handled by split_safe_suffix for routing purposes).
-    //
-    // These classification constants document the safety policy for future
-    // pipe-left substitution logic and must contain the expected entries.
-
-    #[test]
-    fn test_format_preserving_contains_expected() {
-        assert!(
-            FORMAT_PRESERVING.contains(&"tail"),
-            "tail is format-preserving (line-per-line passthrough)"
-        );
-        assert!(
-            FORMAT_PRESERVING.contains(&"echo"),
-            "echo is format-preserving (output equals input)"
-        );
-        assert!(
-            FORMAT_PRESERVING.contains(&"find"),
-            "find is format-preserving (path-per-line)"
-        );
-        assert!(
-            FORMAT_PRESERVING.contains(&"cat"),
-            "cat is format-preserving (byte passthrough)"
-        );
-    }
-
-    #[test]
-    fn test_format_changing_not_in_format_preserving() {
-        // Commands that transform output heavily must NOT be in FORMAT_PRESERVING.
-        // If substituted as left side of a semantic-sink pipe (grep, jq, awk),
-        // the right side would receive unexpected compressed format and break.
-        assert!(
-            !FORMAT_PRESERVING.contains(&"cargo"),
-            "cargo test compresses output — not format-preserving"
-        );
-        assert!(
-            !FORMAT_PRESERVING.contains(&"git"),
-            "git log/diff compresses output — not format-preserving"
-        );
-        assert!(
-            !FORMAT_PRESERVING.contains(&"pytest"),
-            "pytest compresses output — not format-preserving"
-        );
-        assert!(
-            !FORMAT_PRESERVING.contains(&"go"),
-            "go test compresses output — not format-preserving"
-        );
-    }
-
-    #[test]
-    fn test_transparent_sinks_contains_expected() {
-        // Transparent sinks accept any input format — already handled by split_safe_suffix.
-        assert!(
-            TRANSPARENT_SINKS.contains(&"tee"),
-            "tee is a transparent sink (copies stdin to file + stdout)"
-        );
-        assert!(
-            TRANSPARENT_SINKS.contains(&"head"),
-            "head is a transparent sink (truncates lines)"
-        );
-        assert!(
-            TRANSPARENT_SINKS.contains(&"cat"),
-            "cat is a transparent sink (passes through)"
-        );
-        assert!(
-            TRANSPARENT_SINKS.contains(&"tail"),
-            "tail is a transparent sink (last N lines)"
         );
     }
 }
