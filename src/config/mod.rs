@@ -47,6 +47,8 @@ pub struct Config {
     pub filters: FilterConfig,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    #[serde(default)]
+    pub tee: crate::tee::TeeConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
