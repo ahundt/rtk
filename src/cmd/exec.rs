@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 
-use super::{analysis, builtins, filters, lexer};
+use super::{analysis, builtins, filters, lexer, safety, trash_cmd};
 use crate::tracking;
 
 /// Check if RTK is already active (recursion guard)
@@ -47,13 +47,27 @@ pub fn execute(raw: &str, verbose: u8) -> Result<bool> {
 }
 
 fn execute_inner(raw: &str, verbose: u8) -> Result<bool> {
-    // PR 2 adds: crate::config::rules::try_remap() alias expansion
+    // === STEP 0: Remap expansion (aliases like "t" → "cargo test") ===
+    if let Some(expanded) = crate::config::rules::try_remap(raw) {
+        if verbose > 0 {
+            eprintln!(
+                "rtk remap: {} → {}",
+                raw.split_whitespace().next().unwrap_or(raw),
+                expanded
+            );
+        }
+        return execute_inner(&expanded, verbose);
+    }
 
     let tokens = lexer::tokenize(raw);
 
     // === STEP 1: Decide Native vs Passthrough ===
     if analysis::needs_shell(&tokens) {
-        // PR 2 adds: safety::check_raw(raw) before passthrough
+        // Even in passthrough, check safety on raw string
+        if let safety::SafetyResult::Blocked(msg) = safety::check_raw(raw) {
+            eprintln!("{}", msg);
+            return Ok(false);
+        }
         return run_passthrough(raw, verbose);
     }
 
@@ -97,7 +111,26 @@ fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<bool>
         }
         // Other rtk commands: spawn as external (they have their own filters)
 
-        // PR 2 adds: safety::check() dispatch block
+        // === SAFETY CHECK ===
+        match safety::check(&cmd.binary, &cmd.args) {
+            safety::SafetyResult::Blocked(msg) => {
+                eprintln!("{}", msg);
+                return Ok(false);
+            }
+            safety::SafetyResult::Rewritten(new_cmd) => {
+                // Re-execute the rewritten command
+                if verbose > 0 {
+                    eprintln!("rtk safety: Rewrote command");
+                }
+                return execute(&new_cmd, verbose);
+            }
+            safety::SafetyResult::TrashRequested(paths) => {
+                last_success = trash_cmd::execute(&paths)?;
+                prev_operator = cmd.operator.as_deref();
+                continue;
+            }
+            safety::SafetyResult::Safe => {}
+        }
 
         // === BUILTINS ===
         if builtins::is_builtin(&cmd.binary) {
