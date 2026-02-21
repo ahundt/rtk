@@ -1,9 +1,10 @@
 //! Command executor: runs simple chains natively, delegates complex shell to /bin/sh.
 
 use anyhow::{Context, Result};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use super::{analysis, builtins, filters, lexer, safety, trash_cmd};
+use crate::stream::{FilterMode, LineFilter, StdinMode};
 use crate::tracking;
 
 /// Check if RTK is already active (recursion guard)
@@ -27,8 +28,10 @@ impl Drop for RtkActiveGuard {
     }
 }
 
-/// Execute a raw command string
-pub fn execute(raw: &str, verbose: u8) -> Result<bool> {
+/// Execute a raw command string.
+///
+/// Returns the child's POSIX exit code (0 = success, non-zero = failure).
+pub fn execute(raw: &str, verbose: u8) -> Result<i32> {
     // Recursion guard
     if is_rtk_active() {
         if verbose > 0 {
@@ -39,14 +42,14 @@ pub fn execute(raw: &str, verbose: u8) -> Result<bool> {
 
     // Handle empty input
     if raw.trim().is_empty() {
-        return Ok(true);
+        return Ok(0);
     }
 
     let _guard = RtkActiveGuard::new();
     execute_inner(raw, verbose)
 }
 
-fn execute_inner(raw: &str, verbose: u8) -> Result<bool> {
+fn execute_inner(raw: &str, verbose: u8) -> Result<i32> {
     // === STEP 0: Remap expansion (aliases like "t" → "cargo test") ===
     if let Some(expanded) = crate::config::rules::try_remap(raw) {
         if verbose > 0 {
@@ -66,7 +69,7 @@ fn execute_inner(raw: &str, verbose: u8) -> Result<bool> {
         // Even in passthrough, check safety on raw string
         if let safety::SafetyResult::Blocked(msg) = safety::check_raw(raw) {
             eprintln!("{}", msg);
-            return Ok(false);
+            return Ok(1);
         }
         return run_passthrough(raw, verbose);
     }
@@ -79,26 +82,23 @@ fn execute_inner(raw: &str, verbose: u8) -> Result<bool> {
     run_native(&commands, verbose)
 }
 
-/// Run commands in native mode (iterate, check safety, filter output)
-fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<bool> {
-    let mut last_success = true;
+/// Run commands in native mode (iterate, check safety, filter output).
+///
+/// Returns the exit code of the last command executed.
+fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<i32> {
+    let mut last_exit: i32 = 0;
     let mut prev_operator: Option<&str> = None;
 
     for cmd in commands {
         // === SHORT-CIRCUIT LOGIC ===
-        // Check if we should run based on PREVIOUS operator and result
-        // The operator stored in cmd is the one AFTER it, so we use prev_operator
-        if !analysis::should_run(prev_operator, last_success) {
-            // For && with failure or || with success, skip this command
+        // Check if we should run based on PREVIOUS operator and result.
+        if !analysis::should_run(prev_operator, last_exit == 0) {
             prev_operator = cmd.operator.as_deref();
             continue;
         }
 
         // === RECURSION PREVENTION ===
-        // Handle "rtk run" or "rtk" binary specially
         if cmd.binary == "rtk" && cmd.args.first().map(|s| s.as_str()) == Some("run") {
-            // Flatten: execute the inner command directly
-            // rtk run -c "git status" → args = ["run", "-c", "git status"]
             let inner = if cmd.args.get(1).map(|s| s.as_str()) == Some("-c") {
                 cmd.args.get(2).cloned().unwrap_or_default()
             } else {
@@ -109,23 +109,21 @@ fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<bool>
             }
             return execute(&inner, verbose);
         }
-        // Other rtk commands: spawn as external (they have their own filters)
 
         // === SAFETY CHECK ===
         match safety::check(&cmd.binary, &cmd.args) {
             safety::SafetyResult::Blocked(msg) => {
                 eprintln!("{}", msg);
-                return Ok(false);
+                return Ok(1);
             }
             safety::SafetyResult::Rewritten(new_cmd) => {
-                // Re-execute the rewritten command
                 if verbose > 0 {
                     eprintln!("rtk safety: Rewrote command");
                 }
                 return execute(&new_cmd, verbose);
             }
             safety::SafetyResult::TrashRequested(paths) => {
-                last_success = trash_cmd::execute(&paths)?;
+                last_exit = if trash_cmd::execute(&paths)? { 0 } else { 1 };
                 prev_operator = cmd.operator.as_deref();
                 continue;
             }
@@ -134,71 +132,59 @@ fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<bool>
 
         // === BUILTINS ===
         if builtins::is_builtin(&cmd.binary) {
-            last_success = builtins::execute(&cmd.binary, &cmd.args)?;
+            last_exit = if builtins::execute(&cmd.binary, &cmd.args)? {
+                0
+            } else {
+                1
+            };
             prev_operator = cmd.operator.as_deref();
             continue;
         }
 
         // === EXTERNAL COMMAND WITH FILTERING ===
-        last_success = spawn_with_filter(&cmd.binary, &cmd.args, verbose)?;
+        last_exit = spawn_with_filter(&cmd.binary, &cmd.args, verbose)?;
         prev_operator = cmd.operator.as_deref();
     }
 
-    Ok(last_success)
+    Ok(last_exit)
 }
 
-/// Spawn external command and apply appropriate filter
-fn spawn_with_filter(binary: &str, args: &[String], _verbose: u8) -> Result<bool> {
+/// Spawn external command and apply appropriate filter.
+///
+/// Returns the child's POSIX exit code.
+fn spawn_with_filter(binary: &str, args: &[String], _verbose: u8) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
 
     // Try to find the binary in PATH
     let binary_path = match which::which(binary) {
         Ok(path) => path,
         Err(_) => {
-            // Binary not found
             eprintln!("rtk: {}: command not found", binary);
-            return Ok(false);
+            return Ok(127); // POSIX: command not found = 127
         }
     };
 
-    // Use wait_with_output() to avoid deadlock when child output exceeds
-    // pipe buffer (~64KB Linux, ~16KB macOS). This reads stdout/stderr in
-    // separate threads internally before calling wait().
-    let output = Command::new(&binary_path)
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+    let mode = filters::get_filter_mode(binary);
+
+    let mut cmd = Command::new(&binary_path);
+    cmd.args(args);
+
+    let result = crate::stream::run_streaming(&mut cmd, StdinMode::Inherit, mode)
         .with_context(|| format!("Failed to execute: {}", binary))?;
 
-    let raw_out = String::from_utf8_lossy(&output.stdout);
-    let raw_err = String::from_utf8_lossy(&output.stderr);
-
-    // Determine filter type and apply
-    let filter_type = filters::get_filter_type(binary);
-    let filtered_out = filters::apply_to_string(filter_type, &raw_out);
-    let filtered_err = crate::utils::strip_ansi(&raw_err);
-
-    // Print filtered output
-    print!("{}", filtered_out);
-    eprint!("{}", filtered_err);
-
     // Track usage with raw vs filtered for accurate savings
-    let raw_output = format!("{}{}", raw_out, raw_err);
-    let filtered_output = format!("{}{}", filtered_out, filtered_err);
-    timer.track(
-        &format!("{} {}", binary, args.join(" ")),
-        &format!("rtk run {} {}", binary, args.join(" ")),
-        &raw_output,
-        &filtered_output,
-    );
+    let orig_cmd = format!("{} {}", binary, args.join(" "));
+    let rtk_cmd = format!("rtk run {} {}", binary, args.join(" "));
+    timer.track(&orig_cmd, &rtk_cmd, &result.raw, &result.filtered);
 
-    Ok(output.status.success())
+    Ok(result.exit_code)
 }
 
-/// Run command via system shell (passthrough mode)
-pub fn run_passthrough(raw: &str, verbose: u8) -> Result<bool> {
+/// Run command via system shell (passthrough mode).
+///
+/// Uses a streaming ANSI-strip filter for responsive output.
+/// Returns the child shell's POSIX exit code.
+pub fn run_passthrough(raw: &str, verbose: u8) -> Result<i32> {
     if verbose > 0 {
         eprintln!("rtk: Passthrough mode for complex command");
     }
@@ -208,34 +194,26 @@ pub fn run_passthrough(raw: &str, verbose: u8) -> Result<bool> {
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let flag = if cfg!(windows) { "/C" } else { "-c" };
 
-    let output = Command::new(shell)
-        .arg(flag)
-        .arg(raw)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("Failed to execute passthrough")?;
+    let mut cmd = Command::new(shell);
+    cmd.arg(flag).arg(raw);
 
-    let raw_out = String::from_utf8_lossy(&output.stdout);
-    let raw_err = String::from_utf8_lossy(&output.stderr);
+    // Stream output with per-line ANSI stripping (responsive, not buffered).
+    let filter = LineFilter::new(|l| Some(format!("{}\n", crate::utils::strip_ansi(l))));
+    let result = crate::stream::run_streaming(
+        &mut cmd,
+        StdinMode::Inherit,
+        FilterMode::Streaming(Box::new(filter)),
+    )
+    .context("Failed to execute passthrough")?;
 
-    // Basic filtering even in passthrough (strip ANSI)
-    let filtered_out = crate::utils::strip_ansi(&raw_out);
-    let filtered_err = crate::utils::strip_ansi(&raw_err);
-    print!("{}", filtered_out);
-    eprint!("{}", filtered_err);
-
-    let raw_output = format!("{}{}", raw_out, raw_err);
-    let filtered_output = format!("{}{}", filtered_out, filtered_err);
     timer.track(
         raw,
         &format!("rtk passthrough {}", raw),
-        &raw_output,
-        &filtered_output,
+        &result.raw,
+        &result.filtered,
     );
 
-    Ok(output.status.success())
+    Ok(result.exit_code)
 }
 
 #[cfg(test)]
@@ -279,154 +257,172 @@ mod tests {
         );
     }
 
-    // === EXECUTE TESTS ===
+    // === EXIT CODE TESTS (Phase 2 TDD) ===
+
+    #[test]
+    fn test_execute_success_returns_zero() {
+        let code = execute("true", 0).unwrap();
+        assert_eq!(code, 0, "execute('true') must return 0, not bool");
+    }
+
+    #[test]
+    fn test_execute_returns_exit_code_not_bool() {
+        let code = execute("false", 0).unwrap();
+        assert_eq!(code, 1, "execute('false') must return 1 (i32), not bool");
+    }
+
+    #[test]
+    fn test_run_native_and_chain_exit_code() {
+        // "true && false" — last command fails, exit code must be 1
+        let code = execute("true && false", 0).unwrap();
+        assert_eq!(code, 1, "'true && false' must return exit code 1");
+    }
+
+    #[test]
+    fn test_execute_exit_code_propagated_in_passthrough() {
+        // Shell passthrough: exit code must propagate
+        let code = execute("sh -c 'exit 42'", 0).unwrap();
+        assert_eq!(code, 42);
+    }
+
+    // === EXECUTE TESTS (migrated from bool → i32) ===
 
     #[test]
     fn test_execute_empty() {
         let result = execute("", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_whitespace_only() {
         let result = execute("   ", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_simple_command() {
         let result = execute("echo hello", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_builtin_cd() {
         let original = std::env::current_dir().unwrap();
         let result = execute("cd /tmp", 0).unwrap();
-        assert!(result);
-        // On macOS, /tmp might be a symlink to /private/tmp
-        // Just verify the command succeeded (the cd happened)
+        assert_eq!(result, 0);
         let _ = std::env::set_current_dir(&original);
     }
 
     #[test]
     fn test_execute_builtin_pwd() {
         let result = execute("pwd", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_builtin_true() {
         let result = execute("true", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_builtin_false() {
         let result = execute("false", 0).unwrap();
-        assert!(!result);
+        assert_ne!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_and_success() {
         let result = execute("true && echo success", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_and_failure() {
         let result = execute("false && echo should_not_run", 0).unwrap();
-        // Chain stops at false, so result is false
-        assert!(!result);
+        assert_ne!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_or_success() {
         let result = execute("true || echo should_not_run", 0).unwrap();
-        // true succeeds, || doesn't run second command
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_or_failure() {
         let result = execute("false || echo fallback", 0).unwrap();
-        // false fails, || runs fallback
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_semicolon() {
         let result = execute("true ; false", 0).unwrap();
-        // Both run, last result is false
-        assert!(!result);
+        assert_ne!(result, 0);
     }
 
     #[test]
     fn test_execute_passthrough_for_glob() {
         let result = execute("echo *", 0).unwrap();
-        // Should work via passthrough
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_passthrough_for_pipe() {
         let result = execute("echo hello | cat", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_quoted_operator() {
         let result = execute(r#"echo "hello && world""#, 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_execute_binary_not_found() {
         let result = execute("nonexistent_command_xyz_123", 0).unwrap();
-        assert!(!result);
+        assert_ne!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_and_three_commands() {
-        // 3-command chain: true succeeds, false fails, stops before third
         let result = execute("true && false && true", 0).unwrap();
-        assert!(!result);
+        assert_ne!(result, 0);
     }
 
     #[test]
     fn test_execute_chain_semicolon_last_wins() {
-        // Semicolon runs all; last result (true) determines outcome
         let result = execute("false ; true", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
-    // === INTEGRATION TESTS (moved from edge_cases.rs) ===
+    // === INTEGRATION TESTS ===
 
     #[test]
     fn test_chain_mixed_operators() {
-        // false -> || runs true -> true && runs echo
         let result = execute("false || true && echo works", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_passthrough_redirect() {
         let result = execute("echo test > /dev/null", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_integration_cd_tilde() {
         let original = std::env::current_dir().unwrap();
         let result = execute("cd ~", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
         let _ = std::env::set_current_dir(&original);
     }
 
     #[test]
     fn test_integration_export() {
         let result = execute("export TEST_VAR=value", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
         std::env::remove_var("TEST_VAR");
     }
 
@@ -439,20 +435,19 @@ mod tests {
     #[test]
     fn test_integration_dash_args() {
         let result = execute("echo --help -v --version", 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     #[test]
     fn test_integration_quoted_empty() {
         let result = execute(r#"echo """#, 0).unwrap();
-        assert!(result);
+        assert_eq!(result, 0);
     }
 
     // === RECURRENCE PREVENTION TESTS ===
 
     #[test]
     fn test_execute_rtk_recursion() {
-        // This should flatten, not infinitely recurse
         let result = execute("rtk run \"echo hello\"", 0);
         assert!(result.is_ok());
     }

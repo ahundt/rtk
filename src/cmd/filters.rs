@@ -10,6 +10,7 @@
 //! - `src/grep_cmd.rs` — code search (grep, ripgrep)
 //! - `src/pnpm_cmd.rs` — package managers
 
+use crate::stream::{FilterMode, LineFilter};
 use crate::utils;
 
 /// Filter types for different command categories
@@ -76,6 +77,37 @@ fn filter_test_output(output: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Map a binary name to a [`FilterMode`] for use with [`crate::stream::run_streaming`].
+///
+/// This is the streaming counterpart to [`get_filter_type`] + [`apply_to_string`].
+/// Used by `spawn_with_filter` in exec.rs for external commands without dedicated modules.
+pub fn get_filter_mode(binary: &str) -> FilterMode {
+    match binary {
+        // Streaming: per-line ANSI strip + line truncation (low savings, low overhead)
+        "ls" | "find" | "grep" | "rg" | "fd" => {
+            FilterMode::Streaming(Box::new(LineFilter::new(|l| {
+                let stripped = utils::strip_ansi(l);
+                let truncated = if stripped.len() > 120 {
+                    format!("{}...", &stripped[..117])
+                } else {
+                    stripped
+                };
+                Some(format!("{}\n", truncated))
+            })))
+        }
+        // Buffered: cargo, git, and test runners use simple filters here
+        // (dedicated modules like cargo_cmd.rs / go_cmd.rs provide 60-90% savings)
+        "cargo" => FilterMode::Buffered(filter_cargo_output),
+        "pytest" | "jest" | "mocha" | "vitest" => FilterMode::Buffered(filter_test_output),
+        // git: ANSI strip per-line (dedicated git.rs handles git subcommands)
+        "git" => FilterMode::Streaming(Box::new(LineFilter::new(|l| {
+            Some(format!("{}\n", utils::strip_ansi(l)))
+        }))),
+        // Unknown commands: passthrough (no filtering, preserves all output)
+        _ => FilterMode::Passthrough,
+    }
 }
 
 /// Truncate output to max lines

@@ -117,6 +117,71 @@ pub fn run(
     Ok(())
 }
 
+/// Filter raw rg/grep output (file:line:content format) into compact grouped display.
+///
+/// Suitable for use with `rtk pipe --filter grep` when piping raw rg output.
+/// Uses defaults: max_line_len=80, max_results=50, no context-only mode.
+pub(crate) fn filter_grep_raw(input: &str) -> String {
+    if input.trim().is_empty() {
+        return "🔍 0 matches\n".to_string();
+    }
+
+    let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut total = 0;
+    const MAX_RESULTS: usize = 50;
+    const MAX_LINE_LEN: usize = 80;
+
+    for line in input.lines() {
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        let (file, line_num, content) = if parts.len() == 3 {
+            let ln = parts[1].parse().unwrap_or(0);
+            (parts[0].to_string(), ln, parts[2])
+        } else {
+            continue;
+        };
+
+        total += 1;
+        let cleaned = clean_line(content, MAX_LINE_LEN, false, "");
+        by_file.entry(file).or_default().push((line_num, cleaned));
+    }
+
+    if total == 0 {
+        return "🔍 0 matches\n".to_string();
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("🔍 {} in {}F:\n\n", total, by_file.len()));
+
+    let mut shown = 0;
+    let mut files: Vec<_> = by_file.iter().collect();
+    files.sort_by_key(|(f, _)| *f);
+
+    for (file, matches) in files {
+        if shown >= MAX_RESULTS {
+            break;
+        }
+        let file_display = compact_path(file);
+        out.push_str(&format!("📄 {} ({}):\n", file_display, matches.len()));
+        for (line_num, content) in matches.iter().take(10) {
+            out.push_str(&format!("  {:>4}: {}\n", line_num, content));
+            shown += 1;
+            if shown >= MAX_RESULTS {
+                break;
+            }
+        }
+        if matches.len() > 10 {
+            out.push_str(&format!("  +{}\n", matches.len() - 10));
+        }
+        out.push('\n');
+    }
+
+    if total > shown {
+        out.push_str(&format!("... +{}\n", total - shown));
+    }
+
+    out
+}
+
 fn clean_line(line: &str, max_len: usize, context_only: bool, pattern: &str) -> String {
     let trimmed = line.trim();
 
