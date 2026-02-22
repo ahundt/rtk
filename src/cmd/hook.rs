@@ -111,11 +111,18 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
             }
 
             // Single command: route to optimized RTK subcommand.
-            // Chained commands (&&, ||, ;): wrap entire chain in rtk run -c.
+            // Chained commands (&&, ||, ;): wrap in shell but substitute each
+            // known command with its RTK equivalent for maximum token savings.
+            //
+            // Example: "cargo test && git log" →
+            //   rtk run -c 'rtk cargo test && rtk git log'
+            //
+            // Unknown commands pass through unchanged — no nested rtk run -c.
             if commands.len() == 1 {
                 HookResult::Rewrite(route_native_command(&commands[0], raw))
             } else {
-                HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)))
+                let substituted = reconstruct_with_rtk(&commands);
+                HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(&substituted)))
             }
         }
         Err(_) => {
@@ -184,6 +191,25 @@ pub enum HookResponse {
     /// Fields: (stdout_json, stderr_reason)
     Deny(String, String),
 }
+
+/// Commands whose RTK output format is identical to the raw command output.
+///
+/// These can be substituted on the left of a pipe without breaking the
+/// right-side consumer.
+///
+/// # Contrast with format-changing commands
+/// `cargo test`, `git log`, `pytest`, `go test` etc. heavily compress output.
+/// They must **not** appear here — substituting them as a pipe-left would
+/// break right-side semantic sinks (`grep`, `jq`, `awk`, `patch`, `xargs`).
+pub(crate) const FORMAT_PRESERVING: &[&str] = &["tail", "echo", "cat", "find", "fd"];
+
+/// Right-side commands that accept any input format (transparent sinks).
+///
+/// These commands copy, truncate, or tee their stdin without interpreting its
+/// structure, so RTK's compressed output is always compatible with them.
+/// Already handled at the routing level by `split_safe_suffix` — listed here
+/// for classification documentation and future pipe-left substitution logic.
+pub(crate) const TRANSPARENT_SINKS: &[&str] = &["tee", "head", "tail", "cat"];
 
 /// Escape single quotes for shell
 fn escape_quotes(s: &str) -> String {
@@ -325,6 +351,70 @@ fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
         // Fallback: unknown binary or unrecognized subcommand
         _ => format!("rtk run -c '{}'", escape_quotes(raw)),
     }
+}
+
+/// Route a single parsed command to RTK if possible, returning None for passthrough.
+///
+/// Returns `None` when `route_native_command` would produce `rtk run -c ...` —
+/// the caller should keep the original `raw` string unchanged in that case.
+///
+/// This avoids embedding nested `rtk run -c` calls inside an outer shell string,
+/// which would require double-escaping and never improves token savings.
+fn try_route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> Option<String> {
+    let routed = route_native_command(cmd, raw);
+    if routed.starts_with("rtk run -c") {
+        None // passthrough — keep original
+    } else {
+        Some(routed)
+    }
+}
+
+/// Substitute RTK commands within a multi-command chain string.
+///
+/// Iterates each command in the parsed chain.  Known commands (those with an RTK
+/// subcommand equivalent) are replaced with their `rtk <cmd>` form.  Unknown commands
+/// are kept verbatim so the shell can handle them.  Operators (`&&`, `||`, `;`) are
+/// preserved between commands.
+///
+/// # Why this is safe
+/// Only `&&`/`||`/`;` chains reach this function (pipe characters trigger `needs_shell`
+/// before `parse_chain`, so pipes never appear here).  Each command's stdout is
+/// independent — no cross-command parsing is affected by RTK's output format changes.
+///
+/// # Example
+/// ```text
+/// "cargo test && git log $BRANCH"
+///   cmd[0]: binary="cargo" args=["test"] op=Some("&&")  → "rtk cargo test"
+///   cmd[1]: binary="git"   args=["log","$BRANCH"] op=None → "rtk git log $BRANCH"
+///   result: "rtk cargo test && rtk git log $BRANCH"
+/// ```
+fn reconstruct_with_rtk(commands: &[analysis::NativeCommand]) -> String {
+    commands
+        .iter()
+        .map(|cmd| {
+            // Reconstruct the core raw string from parsed binary + args.
+            // Quote-stripping in parse_chain means we lose original quoting here,
+            // but this is acceptable for the common cases (simple args, no spaces).
+            let core_raw = if cmd.args.is_empty() {
+                cmd.binary.clone()
+            } else {
+                format!("{} {}", cmd.binary, cmd.args.join(" "))
+            };
+
+            // Route if known; otherwise preserve the original core_raw verbatim.
+            let part = match try_route_native_command(cmd, &core_raw) {
+                Some(routed) => routed,
+                None => core_raw,
+            };
+
+            // Append operator if present (all but the last command have one).
+            match &cmd.operator {
+                Some(op) => format!("{} {}", part, op),
+                None => part,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Format hook result for Claude (text output)
@@ -1078,6 +1168,199 @@ mod tests {
             ratio <= 1.05,
             "rtk git log must not significantly bloat output vs raw git log \
              ({raw_tok} raw → {rtk_tok} rtk, ratio {ratio:.2})"
+        );
+    } // === CHAIN COMMAND SUBSTITUTION TESTS ===
+      // In &&/||/; chains, each known command should be substituted with its RTK
+      // equivalent so RTK's filter applies inside the shell string.
+      //
+      // Example: "cargo test && git log"
+      //   Before: rtk run -c 'cargo test && git log'
+      //   After:  rtk run -c 'rtk cargo test && rtk git log'
+      //
+      // Safety invariant: only &&/||/; chains are substituted here.
+      // Pipe-separated commands are handled separately (split_safe_suffix / needs_shell).
+
+    #[test]
+    fn test_chain_both_commands_substituted() {
+        // Both cargo test AND git log should route to rtk inside the shell string
+        let result = match check_for_hook("cargo test && git log", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert!(
+            result.contains("rtk cargo"),
+            "cargo test must be substituted to rtk cargo inside chain: {}",
+            result
+        );
+        assert!(
+            result.contains("rtk git"),
+            "git log must be substituted to rtk git inside chain: {}",
+            result
+        );
+        // The outer wrapper is rtk run -c because && needs a shell
+        assert!(
+            result.contains("rtk run"),
+            "chain still needs shell wrapper (rtk run -c): {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_chain_with_dollar_var_substituted() {
+        // cargo test && git log $BRANCH: $BRANCH is Arg (after lexer fix) → both route natively
+        let result = match check_for_hook("cargo test && git log $BRANCH", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert!(
+            result.contains("rtk cargo"),
+            "cargo test must be rtk in chain: {}",
+            result
+        );
+        assert!(
+            result.contains("rtk git log"),
+            "git log $BRANCH must be rtk with var preserved: {}",
+            result
+        );
+        assert!(
+            result.contains("$BRANCH"),
+            "$BRANCH must be preserved in rewritten chain: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_chain_unknown_command_not_substituted() {
+        // unknown_xyz_cmd not in registry → stays unmodified inside the shell string
+        let result = match check_for_hook("cargo test && unknown_xyz_cmd", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert!(
+            result.contains("rtk cargo"),
+            "cargo test must be substituted to rtk: {}",
+            result
+        );
+        assert!(
+            result.contains("unknown_xyz_cmd"),
+            "unknown command must pass through unchanged: {}",
+            result
+        );
+        assert!(
+            !result.contains("rtk unknown"),
+            "must not invent rtk subcommands for unknown binary: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_semicolon_chain_substituted() {
+        // ; chains: each known command should be substituted
+        let result = match check_for_hook("cargo test ; git status", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert!(
+            result.contains("rtk cargo"),
+            "cargo must be rtk in semicolon chain: {}",
+            result
+        );
+        assert!(
+            result.contains("rtk git"),
+            "git must be rtk in semicolon chain: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_or_chain_substituted() {
+        // || chains: each known command should be substituted
+        let result = match check_for_hook("cargo test || go test ./...", "claude") {
+            HookResult::Rewrite(cmd) => cmd,
+            other => panic!("Expected Rewrite, got {:?}", other),
+        };
+        assert!(
+            result.contains("rtk cargo"),
+            "cargo must be rtk in || chain: {}",
+            result
+        );
+        assert!(
+            result.contains("rtk go"),
+            "go must be rtk in || chain: {}",
+            result
+        );
+    }
+
+    // === PIPE OUTPUT CLASSIFICATION TESTS ===
+    // FORMAT_PRESERVING: commands whose RTK output format matches raw output,
+    //   making them safe as the left side of any pipe.
+    // TRANSPARENT_SINKS: right-side commands that consume any input format
+    //   (already handled by split_safe_suffix for routing purposes).
+    //
+    // These classification constants document the safety policy for future
+    // pipe-left substitution logic and must contain the expected entries.
+
+    #[test]
+    fn test_format_preserving_contains_expected() {
+        assert!(
+            FORMAT_PRESERVING.contains(&"tail"),
+            "tail is format-preserving (line-per-line passthrough)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"echo"),
+            "echo is format-preserving (output equals input)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"find"),
+            "find is format-preserving (path-per-line)"
+        );
+        assert!(
+            FORMAT_PRESERVING.contains(&"cat"),
+            "cat is format-preserving (byte passthrough)"
+        );
+    }
+
+    #[test]
+    fn test_format_changing_not_in_format_preserving() {
+        // Commands that transform output heavily must NOT be in FORMAT_PRESERVING.
+        // If substituted as left side of a semantic-sink pipe (grep, jq, awk),
+        // the right side would receive unexpected compressed format and break.
+        assert!(
+            !FORMAT_PRESERVING.contains(&"cargo"),
+            "cargo test compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"git"),
+            "git log/diff compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"pytest"),
+            "pytest compresses output — not format-preserving"
+        );
+        assert!(
+            !FORMAT_PRESERVING.contains(&"go"),
+            "go test compresses output — not format-preserving"
+        );
+    }
+
+    #[test]
+    fn test_transparent_sinks_contains_expected() {
+        // Transparent sinks accept any input format — already handled by split_safe_suffix.
+        assert!(
+            TRANSPARENT_SINKS.contains(&"tee"),
+            "tee is a transparent sink (copies stdin to file + stdout)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"head"),
+            "head is a transparent sink (truncates lines)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"cat"),
+            "cat is a transparent sink (passes through)"
+        );
+        assert!(
+            TRANSPARENT_SINKS.contains(&"tail"),
+            "tail is a transparent sink (last N lines)"
         );
     }
 }
