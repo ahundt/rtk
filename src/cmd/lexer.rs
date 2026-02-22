@@ -7,7 +7,7 @@ pub enum TokenKind {
     Operator, // &&, ||, ;
     Pipe,     // |
     Redirect, // >, >>, <, 2>
-    Shellism, // *, $, `, (, ), {, } - forces passthrough
+    Shellism, // *, ?, `, (, ), {, }, !, & — forces passthrough; $ only for complex forms
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,8 +55,39 @@ pub fn tokenize(input: &str) -> Vec<ParsedToken> {
 
         // Outside quotes - handle operators and shellisms
         match c {
-            // Shellisms force passthrough (includes ! for history expansion/negation)
-            '*' | '?' | '$' | '`' | '(' | ')' | '{' | '}' | '!' => {
+            // '$' handling: simple $IDENT forms become Arg tokens.
+            // The shell expands them when executing the rewritten "rtk cmd $VAR" —
+            // RTK itself never needs to expand variables.
+            // Complex forms ($(), ${}, $?, $$, $!, $0–$9) remain Shellism.
+            '$' => {
+                flush_arg(&mut tokens, &mut current);
+                // Peek at the next char: alphabetic or '_' → consume a $IDENT as Arg.
+                // Digits and special chars → Shellism (positional/special variables).
+                if chars
+                    .peek()
+                    .map_or(false, |&nc| nc.is_ascii_alphabetic() || nc == '_')
+                {
+                    let mut name = String::from("$");
+                    while chars
+                        .peek()
+                        .map_or(false, |&nc| nc.is_ascii_alphanumeric() || nc == '_')
+                    {
+                        name.push(chars.next().unwrap());
+                    }
+                    tokens.push(ParsedToken {
+                        kind: TokenKind::Arg,
+                        value: name,
+                    });
+                } else {
+                    // $(), ${}, $?, $$, $!, $1, bare $ — all need real shell
+                    tokens.push(ParsedToken {
+                        kind: TokenKind::Shellism,
+                        value: "$".to_string(),
+                    });
+                }
+            }
+            // Remaining shellisms force passthrough (includes ! for history expansion/negation)
+            '*' | '?' | '`' | '(' | ')' | '{' | '}' | '!' => {
                 flush_arg(&mut tokens, &mut current);
                 tokens.push(ParsedToken {
                     kind: TokenKind::Shellism,
@@ -371,8 +402,19 @@ mod tests {
 
     #[test]
     fn test_variable_detection() {
+        // After the $VAR-as-Arg fix, simple $IDENT is now TokenKind::Arg, not Shellism.
+        // The shell expands the variable when running the rewritten "rtk echo $HOME".
         let tokens = tokenize("echo $HOME");
-        assert!(tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.kind, TokenKind::Arg) && t.value == "$HOME"),
+            "Simple $VAR must now be Arg — shell expands at execution time"
+        );
+        assert!(
+            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "No Shellism expected for simple $VAR after lexer fix"
+        );
     }
 
     #[test]
@@ -469,6 +511,74 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t.kind, TokenKind::Shellism) && t.value == "&"),
             "Single & (background job) must be Shellism, not Redirect"
+        );
+    } // === $VAR AS ARG TESTS ===
+      // Simple $IDENT forms are Arg (shell expands at execution time when running
+      // the rewritten "rtk cmd $VAR").  Complex forms ($(), ${}, $?, $$, $!, $0-$9)
+      // remain Shellism — they require real shell expansion before execution.
+
+    #[test]
+    fn test_simple_var_is_arg() {
+        // $HOME after space → Arg("$HOME"), NOT Shellism.
+        let tokens = tokenize("git log $HOME");
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t.kind, TokenKind::Arg) && t.value == "$HOME"),
+            "Simple $VAR must be Arg, not Shellism — shell expands at execution time"
+        );
+        assert!(
+            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "No Shellism tokens expected for simple $VAR commands"
+        );
+    }
+
+    #[test]
+    fn test_simple_var_enables_native_routing() {
+        let tokens = tokenize("git log $BRANCH");
+        assert!(
+            !tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "git log $BRANCH must have no Shellism — simple $VAR is Arg, not Shellism"
+        );
+    }
+
+    #[test]
+    fn test_dollar_subshell_stays_shellism() {
+        // $(...) subshell: the '(' is a Shellism
+        let tokens = tokenize("echo $(date)");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "$(...) must produce Shellism — subshell requires real shell"
+        );
+    }
+
+    #[test]
+    fn test_dollar_brace_stays_shellism() {
+        // ${VAR} parameter expansion: the '{' is a Shellism
+        let tokens = tokenize("echo ${HOME}");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "${{VAR}} must produce Shellism — brace expansion requires real shell"
+        );
+    }
+
+    #[test]
+    fn test_dollar_special_vars_stay_shellism() {
+        // $? (last exit code) — bare $ followed by '?' → Shellism
+        let tokens = tokenize("echo $?");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "$? must be Shellism — special variable requires real shell"
+        );
+    }
+
+    #[test]
+    fn test_dollar_digit_stays_shellism() {
+        // $1 positional arg — bare $ followed by digit → Shellism
+        let tokens = tokenize("echo $1");
+        assert!(
+            tokens.iter().any(|t| matches!(t.kind, TokenKind::Shellism)),
+            "$1 must be Shellism — positional variable requires real shell"
         );
     }
 }
