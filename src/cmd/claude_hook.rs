@@ -67,7 +67,7 @@
 // Why restrict here:
 // - Claude Code hook protocol requires JSON-only stdout
 // - Claude Code rule: "ANY stderr at exit 0 = hook error = fail-open"
-//   (Source: clautorun hooks_api_reference.md:720-728)
+//   (Source: https://docs.anthropic.com/en/docs/claude-code/hooks)
 // - Accidental prints would corrupt the JSON response
 //
 // Mechanism:
