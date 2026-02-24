@@ -329,6 +329,7 @@ fn route_pnpm(cmd: &analysis::NativeCommand, raw: &str) -> String {
 
         "tsc" => replace_first_word(raw, "pnpm tsc", "rtk tsc"),
         "lint" => replace_first_word(raw, "pnpm lint", "rtk lint"),
+        "eslint" => replace_first_word(raw, "pnpm eslint", "rtk lint"),
         "playwright" => replace_first_word(raw, "pnpm playwright", "rtk playwright"),
 
         _ => format!("rtk run -c '{}'", escape_quotes(raw)),
@@ -382,7 +383,7 @@ fn route_npx(cmd: &analysis::NativeCommand, raw: &str) -> String {
 /// ## Safety interaction
 /// `safety::check` runs BEFORE this function. Blocked commands (cat, head, sed)
 /// never reach here. The `cat` arm is defensive for when `RTK_BLOCK_TOKEN_WASTE=0`.
-fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
+pub(crate) fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
     // === ENV PREFIX STRIPPING ===
     // When the "binary" is actually a VAR=val env assignment (e.g. "GIT_PAGER=cat"),
     // collect all leading env assigns, find the real binary in args, route it, and
@@ -482,7 +483,7 @@ fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> String {
 ///
 /// This avoids embedding nested `rtk run -c` calls inside an outer shell string,
 /// which would require double-escaping and never improves token savings.
-fn try_route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> Option<String> {
+pub(crate) fn try_route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> Option<String> {
     let routed = route_native_command(cmd, raw);
     if routed.starts_with("rtk run -c") {
         None // passthrough — keep original
@@ -1254,6 +1255,9 @@ mod tests {
             ("pnpm test", "rtk vitest run"),
             ("pnpm vitest", "rtk vitest run"),
             ("pnpm lint", "rtk lint"),
+            ("pnpm eslint src/", "rtk lint"), // pnpm eslint → rtk lint
+            ("pnpm eslint .", "rtk lint ."),  // pnpm eslint bare form
+            ("pnpm eslint --fix src/", "rtk lint"), // pnpm eslint with flag
             ("npx tsc --noEmit", "rtk tsc --noEmit"),
             // Python
             ("python -m pytest tests/", "rtk pytest tests/"),
