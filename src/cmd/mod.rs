@@ -10,15 +10,13 @@
 
 pub(crate) mod analysis;
 pub(crate) mod builtins;
-pub mod claude_hook;
 pub mod exec;
 pub(crate) mod filters;
-pub mod gemini_hook;
 pub mod hook;
 pub(crate) mod lexer;
 pub(crate) mod predicates;
 pub(crate) mod safety;
-pub(crate) mod trash_cmd;
+pub(crate) mod trash;
 
 #[cfg(test)]
 pub(crate) mod test_helpers;

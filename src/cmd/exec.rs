@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
-use super::{analysis, builtins, filters, lexer, safety, trash_cmd};
+use super::{analysis, builtins, filters, lexer, safety, trash};
 use crate::stream::{FilterMode, LineFilter, StdinMode};
 use crate::tracking;
 
@@ -123,7 +123,7 @@ fn run_native(commands: &[analysis::NativeCommand], verbose: u8) -> Result<i32> 
                 return execute(&new_cmd, verbose);
             }
             safety::SafetyResult::TrashRequested(paths) => {
-                last_exit = if trash_cmd::execute(&paths)? { 0 } else { 1 };
+                last_exit = if trash::execute(&paths)? { 0 } else { 1 };
                 prev_operator = cmd.operator.as_deref();
                 continue;
             }
