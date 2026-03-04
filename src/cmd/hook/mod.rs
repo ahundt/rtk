@@ -1694,4 +1694,30 @@ mod tests {
              ({raw_tok} raw → {rtk_tok} rtk, ratio {ratio:.2})"
         );
     }
+
+    // === CAT BEHAVIOR TESTS ===
+
+    #[test]
+    fn test_cat_multi_file_is_blocked() {
+        // cat is blocked by data-safety rules (src/rules/rtk.safety.block-cat.md).
+        // The routing code at hook/mod.rs:453 (cat→rtk read) is a defensive fallback
+        // for RTK_BLOCK_TOKEN_WASTE=0; under normal operation cat always hits Blocked.
+        let result = check_for_hook("cat file1.txt file2.txt", "claude");
+        assert!(
+            matches!(&result, HookResult::Blocked(_)),
+            "cat (multi-file) must be Blocked by safety rules; got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_cat_single_file_is_blocked() {
+        // Same blocking rule applies for single-file cat — no special-casing by arity.
+        let result = check_for_hook("cat CLAUDE.md", "claude");
+        assert!(
+            matches!(&result, HookResult::Blocked(_)),
+            "cat (single-file) must be Blocked by safety rules; got: {:?}",
+            result
+        );
+    }
 }
