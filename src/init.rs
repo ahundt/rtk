@@ -7,6 +7,9 @@ use tempfile::NamedTempFile;
 // Embedded slim RTK awareness instructions
 const RTK_SLIM: &str = include_str!("../hooks/rtk-awareness.md");
 
+// Embedded hook script (for --hook-type script mode)
+const REWRITE_HOOK: &str = include_str!("../hooks/rtk-rewrite.sh");
+
 /// Control flow for settings.json patching
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatchMode {
@@ -22,6 +25,18 @@ pub enum PatchResult {
     AlreadyPresent, // Hook was already in settings.json
     Declined,       // User declined when prompted
     Skipped,        // --no-patch flag used
+}
+
+/// Which hook mechanism to install for Claude Code PreToolUse:Bash.
+///
+/// Binary: installs `"rtk hook claude"` directly. Fastest, no shell dependency.
+/// Script: deploys `rtk-rewrite.sh` and installs it as the hook. Shell-portable.
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
+pub enum HookType {
+    /// Install "rtk hook claude" as the Claude Code hook (fast, no shell dependency)
+    Binary,
+    /// Deploy rtk-rewrite.sh and install it as the Claude Code hook (shell-portable)
+    Script,
 }
 
 // Legacy full instructions for backward compatibility (--claude-md mode)
@@ -166,14 +181,66 @@ pub fn run(
     claude_md: bool,
     hook_only: bool,
     patch_mode: PatchMode,
+    hook_type: HookType,
     verbose: u8,
 ) -> Result<()> {
     // Mode selection
     match (claude_md, hook_only) {
         (true, _) => run_claude_md_mode(global, verbose),
-        (false, true) => run_hook_only_mode(global, patch_mode, verbose),
-        (false, false) => run_default_mode(global, patch_mode, verbose),
+        (false, true) => run_hook_only_mode(global, patch_mode, hook_type, verbose),
+        (false, false) => run_default_mode(global, patch_mode, hook_type, verbose),
     }
+}
+
+/// Compute hook directory and script path for --hook-type script mode.
+fn prepare_hook_paths() -> Result<(PathBuf, PathBuf)> {
+    let claude_dir = resolve_claude_dir()?;
+    let hook_dir = claude_dir.join("hooks");
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("Failed to create hook directory: {}", hook_dir.display()))?;
+    let hook_path = hook_dir.join("rtk-rewrite.sh");
+    Ok((hook_dir, hook_path))
+}
+
+/// Write hook script if missing or outdated, return true if changed.
+/// Used by --hook-type script mode.
+#[cfg(unix)]
+fn ensure_hook_installed(hook_path: &Path, verbose: u8) -> Result<bool> {
+    let changed = if hook_path.exists() {
+        let existing = fs::read_to_string(hook_path)
+            .with_context(|| format!("Failed to read existing hook: {}", hook_path.display()))?;
+        if existing == REWRITE_HOOK {
+            if verbose > 0 {
+                eprintln!("Hook already up to date: {}", hook_path.display());
+            }
+            false
+        } else {
+            fs::write(hook_path, REWRITE_HOOK)
+                .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
+            if verbose > 0 {
+                eprintln!("Updated hook: {}", hook_path.display());
+            }
+            true
+        }
+    } else {
+        fs::write(hook_path, REWRITE_HOOK)
+            .with_context(|| format!("Failed to write hook to {}", hook_path.display()))?;
+        if verbose > 0 {
+            eprintln!("Created hook: {}", hook_path.display());
+        }
+        true
+    };
+
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(hook_path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("Failed to set hook permissions: {}", hook_path.display()))?;
+
+    Ok(changed)
+}
+
+#[cfg(not(unix))]
+fn ensure_hook_installed(_hook_path: &Path, _verbose: u8) -> Result<bool> {
+    Ok(false) // Script mode not supported on non-Unix platforms
 }
 
 /// Idempotent file write: create or update if content differs
@@ -711,18 +778,26 @@ fn patch_settings_shared(
 ///   - Old "rtk hook claude": removes then re-inserts (idempotent)
 ///   - Part 1 "rtk-autorun-bash.sh" wrapper: removes wrapper, inserts canonical command
 ///   - Already correct: removes then re-inserts (safe, atomic)
-fn patch_settings_json(mode: PatchMode, verbose: u8) -> Result<PatchResult> {
+fn patch_settings_json(mode: PatchMode, hook_type: HookType, verbose: u8) -> Result<PatchResult> {
     let settings_path = resolve_claude_dir()?.join("settings.json");
-    let hook_command = "rtk hook claude";
+    let hook_command: String = match hook_type {
+        HookType::Binary => "rtk hook claude".to_owned(),
+        HookType::Script => {
+            let (_, hook_path) = prepare_hook_paths()?;
+            ensure_hook_installed(&hook_path, verbose)?;
+            hook_path.to_string_lossy().into_owned()
+        }
+    };
 
     // Remove any stale RTK hooks first (idempotent upgrade path)
     remove_hook_from_settings_file(&settings_path, remove_hook_from_json, verbose)?;
 
+    let cmd = hook_command.as_str();
     patch_settings_shared(
         &settings_path,
-        |root| hook_already_present(root, hook_command),
-        |root| insert_hook_entry(root, hook_command),
-        || print_manual_instructions(hook_command),
+        |root| hook_already_present(root, cmd),
+        |root| insert_hook_entry(root, cmd),
+        || print_manual_instructions(cmd),
         mode,
         "settings.json",
         "Restart Claude Code. Test with: git status",
@@ -830,7 +905,12 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
 
 /// Default mode: hook + slim RTK.md + @RTK.md reference
 #[cfg(not(unix))]
-fn run_default_mode(_global: bool, _patch_mode: PatchMode, _verbose: u8) -> Result<()> {
+fn run_default_mode(
+    _global: bool,
+    _patch_mode: PatchMode,
+    _hook_type: HookType,
+    _verbose: u8,
+) -> Result<()> {
     eprintln!("⚠️  Hook-based mode requires Unix (macOS/Linux).");
     eprintln!("    Windows: use --claude-md mode for full injection.");
     eprintln!("    Falling back to --claude-md mode.");
@@ -838,7 +918,12 @@ fn run_default_mode(_global: bool, _patch_mode: PatchMode, _verbose: u8) -> Resu
 }
 
 #[cfg(unix)]
-fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<()> {
+fn run_default_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    hook_type: HookType,
+    verbose: u8,
+) -> Result<()> {
     if !global {
         // Local init: unchanged behavior (full injection into ./CLAUDE.md)
         return run_claude_md_mode(false, verbose);
@@ -890,7 +975,7 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
     }
 
     // 6. Patch settings.json
-    let patch_result = patch_settings_json(patch_mode, verbose)?;
+    let patch_result = patch_settings_json(patch_mode, hook_type, verbose)?;
 
     // Report result
     match patch_result {
@@ -920,12 +1005,22 @@ fn run_default_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<
 
 /// Hook-only mode: just the hook, no RTK.md
 #[cfg(not(unix))]
-fn run_hook_only_mode(_global: bool, _patch_mode: PatchMode, _verbose: u8) -> Result<()> {
+fn run_hook_only_mode(
+    _global: bool,
+    _patch_mode: PatchMode,
+    _hook_type: HookType,
+    _verbose: u8,
+) -> Result<()> {
     anyhow::bail!("Hook install requires Unix (macOS/Linux). Use WSL or --claude-md mode.")
 }
 
 #[cfg(unix)]
-fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Result<()> {
+fn run_hook_only_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    hook_type: HookType,
+    verbose: u8,
+) -> Result<()> {
     if !global {
         eprintln!("⚠️  Warning: --hook-only only makes sense with --global");
         eprintln!("    For local projects, use default mode or --claude-md");
@@ -948,7 +1043,7 @@ fn run_hook_only_mode(global: bool, patch_mode: PatchMode, verbose: u8) -> Resul
     }
 
     // Patch settings.json
-    let patch_result = patch_settings_json(patch_mode, verbose)?;
+    let patch_result = patch_settings_json(patch_mode, hook_type, verbose)?;
 
     // Report result
     match patch_result {
@@ -1465,7 +1560,8 @@ pub(crate) fn patch_plugin_caches(verbose: u8) -> Result<usize> {
 
 /// Patch a single plugin cache JSON file: remove Bash from PreToolUse matchers.
 /// Appends to manifest if changed and not already present.
-/// Returns Ok(true) if newly patched, Ok(false) if already present or no Bash found.
+/// Returns Ok(true) if the manifest was updated (newly patched or reconstructed),
+/// Ok(false) if already present or no PreToolUse hooks found.
 fn patch_single_cache_file(
     hook_path: &Path,
     vendor_name: &str,
@@ -1498,9 +1594,62 @@ fn patch_single_cache_file(
         .and_then(|p| p.as_array_mut())
     {
         Some(arr) => arr,
-        None => return Ok(false), // No PreToolUse hooks → no Bash to remove
+        None => return Ok(false), // No PreToolUse hooks → nothing to register
     };
 
+    // Check whether any entry still has Bash in its matcher.
+    // If Bash is present → first-run path: patch the file and add to manifest.
+    // If no Bash anywhere → reconstruction path: Bash was already removed by a prior
+    //   rtk init that didn't create a backup file. Register the current PreToolUse
+    //   entries in the manifest so the binary hook still calls them as fallthrough
+    //   handlers for Bash events. Safe for uninstall: original_matcher == patched_matcher
+    //   so the restore is a write-back no-op (same value written). If the plugin never
+    //   actually handled Bash, it will return exit 0 (pass-through) when called.
+    let has_any_bash = pre_tool_use
+        .iter()
+        .any(|e| matcher_contains_bash(e.get("matcher").and_then(|m| m.as_str()).unwrap_or("")));
+
+    if !has_any_bash {
+        // Reconstruction path: no Bash in any entry. Add all non-empty matchers to
+        // manifest so fallthrough mechanism includes this plugin's Bash event handling.
+        let mut any_added = false;
+        for entry in pre_tool_use.iter() {
+            let matcher = entry
+                .get("matcher")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if matcher.is_empty() {
+                continue;
+            }
+            let command = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|h| h.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            let resolved_command =
+                resolve_plugin_root_in_command(&command, vendor_name, plugin_name, settings_root);
+            if verbose > 0 {
+                eprintln!(
+                    "Reconstructed manifest entry for '{}' (Bash already removed)",
+                    hook_path.display()
+                );
+            }
+            manifest.entries.push(ManifestEntry {
+                cache_path: cache_path_str.clone(),
+                original_matcher: matcher.clone(), // unknown true original; use current
+                patched_matcher: matcher,          // same → uninstall restore is a no-op
+                fallthrough_command: resolved_command,
+            });
+            any_added = true;
+        }
+        return Ok(any_added);
+    }
+
+    // First-run path: at least one entry has Bash. Patch the file.
     let mut any_patched = false;
 
     for entry in pre_tool_use.iter_mut() {
@@ -1614,8 +1763,41 @@ fn resolve_plugin_root_in_command(
         .and_then(|s| s.get("path"))
         .and_then(|p| p.as_str())
     {
-        let plugin_root = format!("{}/plugins/{}", marketplace_path, plugin_name);
-        return command.replace("${CLAUDE_PLUGIN_ROOT}", &plugin_root);
+        // Try computed path: {marketplace}/plugins/{plugin_name}
+        let primary = format!("{}/plugins/{}", marketplace_path, plugin_name);
+        if Path::new(&primary).exists() {
+            return command.replace("${CLAUDE_PLUGIN_ROOT}", &primary);
+        }
+
+        // Fallback 1: {marketplace}/plugins/{vendor_name}
+        // Plugin package name (e.g. "ar") may differ from source dir (e.g. "autorun").
+        let by_vendor = format!("{}/plugins/{}", marketplace_path, vendor_name);
+        if Path::new(&by_vendor).exists() {
+            return command.replace("${CLAUDE_PLUGIN_ROOT}", &by_vendor);
+        }
+
+        // Fallback 2: scan immediate subdirs of {marketplace}/plugins/ for first
+        // dir that contains a hooks/ subdirectory (plugin source convention).
+        let plugins_dir = format!("{}/plugins", marketplace_path);
+        if let Ok(entries) = fs::read_dir(&plugins_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir()
+                    && p.join("hooks").is_dir()
+                    && !p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with('.') || n == "__pycache__" || n.contains("venv"))
+                        .unwrap_or(false)
+                {
+                    return command
+                        .replace("${CLAUDE_PLUGIN_ROOT}", &p.to_string_lossy().into_owned());
+                }
+            }
+        }
+
+        // None of the fallbacks found — use computed primary (will fail at runtime)
+        return command.replace("${CLAUDE_PLUGIN_ROOT}", &primary);
     }
 
     // Fall back to standard marketplace location
@@ -2662,5 +2844,135 @@ More notes
 
         let removed = remove_hook_from_json(&mut json_content);
         assert!(!removed);
+    }
+
+    // --- patch_single_cache_file tests ---
+
+    fn make_cache_json(matcher: &str, command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": matcher,
+                    "hooks": [{"type": "command", "command": command}]
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn test_patch_single_cache_file_first_run_bash_removed() {
+        let temp = TempDir::new().unwrap();
+        let hook_file = temp.path().join("claude-hooks.json");
+        let json = make_cache_json("Bash|Write|Edit", "my-hook --cli claude");
+        fs::write(&hook_file, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let mut manifest = BashManifest::default();
+        let settings = serde_json::json!({});
+        let result =
+            patch_single_cache_file(&hook_file, "vendor", "plugin", &settings, &mut manifest, 0);
+
+        assert!(result.unwrap(), "should return true when Bash removed");
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.entries[0].original_matcher, "Bash|Write|Edit");
+        assert_eq!(manifest.entries[0].patched_matcher, "Write|Edit");
+        assert_eq!(
+            manifest.entries[0].fallthrough_command,
+            "my-hook --cli claude"
+        );
+
+        // Verify file was actually patched
+        let patched: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hook_file).unwrap()).unwrap();
+        let matcher = patched["hooks"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        assert_eq!(matcher, "Write|Edit");
+    }
+
+    #[test]
+    fn test_patch_single_cache_file_reconstruction_no_bash() {
+        // Bash was already removed; no backup exists. Should reconstruct manifest entry.
+        let temp = TempDir::new().unwrap();
+        let hook_file = temp.path().join("claude-hooks.json");
+        let json = make_cache_json("Write|Edit|ExitPlanMode", "autorun-hook --cli claude");
+        fs::write(&hook_file, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let mut manifest = BashManifest::default();
+        let settings = serde_json::json!({});
+        let result =
+            patch_single_cache_file(&hook_file, "vendor", "plugin", &settings, &mut manifest, 0);
+
+        assert!(result.unwrap(), "should return true for reconstruction");
+        assert_eq!(manifest.entries.len(), 1);
+        // original_matcher == patched_matcher (safe uninstall no-op)
+        assert_eq!(
+            manifest.entries[0].original_matcher,
+            manifest.entries[0].patched_matcher
+        );
+        assert_eq!(
+            manifest.entries[0].patched_matcher,
+            "Write|Edit|ExitPlanMode"
+        );
+        assert_eq!(
+            manifest.entries[0].fallthrough_command,
+            "autorun-hook --cli claude"
+        );
+
+        // File should NOT be modified (no Bash to remove)
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hook_file).unwrap()).unwrap();
+        let matcher = after["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap();
+        assert_eq!(
+            matcher, "Write|Edit|ExitPlanMode",
+            "file should be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_patch_single_cache_file_idempotent_with_manifest() {
+        let temp = TempDir::new().unwrap();
+        let hook_file = temp.path().join("claude-hooks.json");
+        let json = make_cache_json("Write|Edit|ExitPlanMode", "cmd");
+        fs::write(&hook_file, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let cache_path_str = hook_file.to_string_lossy().into_owned();
+        let mut manifest = BashManifest::default();
+        // Pre-populate manifest as if first run already completed
+        manifest.entries.push(ManifestEntry {
+            cache_path: cache_path_str,
+            original_matcher: "Write|Edit|ExitPlanMode".to_string(),
+            patched_matcher: "Write|Edit|ExitPlanMode".to_string(),
+            fallthrough_command: "cmd".to_string(),
+        });
+
+        let settings = serde_json::json!({});
+        let result =
+            patch_single_cache_file(&hook_file, "vendor", "plugin", &settings, &mut manifest, 0);
+
+        assert!(
+            !result.unwrap(),
+            "should return false (already in manifest)"
+        );
+        assert_eq!(
+            manifest.entries.len(),
+            1,
+            "no new entry added on second run"
+        );
+    }
+
+    #[test]
+    fn test_patch_single_cache_file_no_pretooluse() {
+        let temp = TempDir::new().unwrap();
+        let hook_file = temp.path().join("claude-hooks.json");
+        let json = serde_json::json!({"hooks": {"PostToolUse": []}});
+        fs::write(&hook_file, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let mut manifest = BashManifest::default();
+        let settings = serde_json::json!({});
+        let result =
+            patch_single_cache_file(&hook_file, "vendor", "plugin", &settings, &mut manifest, 0);
+
+        assert!(!result.unwrap(), "should return false (no PreToolUse)");
+        assert!(manifest.entries.is_empty());
     }
 }

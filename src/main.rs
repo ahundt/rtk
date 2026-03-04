@@ -317,6 +317,10 @@ enum Commands {
         /// Remove all RTK artifacts (hook, RTK.md, CLAUDE.md reference, settings.json entry)
         #[arg(long)]
         uninstall: bool,
+
+        /// Hook type to install: "binary" (rtk hook claude) or "script" (rtk-rewrite.sh).
+        #[arg(long = "hook-type", value_enum, default_value_t = init::HookType::Binary)]
+        hook_type: init::HookType,
     },
 
     /// Download with compact output (strips progress bars)
@@ -1205,6 +1209,7 @@ fn main() -> Result<()> {
             auto_patch,
             no_patch,
             uninstall,
+            hook_type,
         } => {
             if show {
                 init::show_config()?;
@@ -1233,7 +1238,14 @@ fn main() -> Result<()> {
                 let setup_gemini = !claude || gemini;
 
                 if setup_claude {
-                    init::run(global, claude_md, hook_only, patch_mode, cli.verbose)?;
+                    init::run(
+                        global,
+                        claude_md,
+                        hook_only,
+                        patch_mode,
+                        hook_type,
+                        cli.verbose,
+                    )?;
                 }
                 if setup_gemini {
                     init::run_gemini(patch_mode, cli.verbose)?;
