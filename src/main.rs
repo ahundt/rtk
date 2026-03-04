@@ -1670,10 +1670,10 @@ fn main() -> Result<()> {
                 }
             }
             HookCommands::Claude => {
-                cmd::claude_hook::run()?;
+                cmd::hook::claude::run()?;
             }
             HookCommands::Gemini => {
-                cmd::gemini_hook::run()?;
+                cmd::hook::gemini::run()?;
             }
         },
     }
