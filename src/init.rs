@@ -195,6 +195,76 @@ struct EnvIssue {
     links: Vec<&'static str>,
 }
 
+/// Return shell-specific PATH setup instructions for the user's current shell.
+///
+/// Reads `$SHELL` from the environment and dispatches to per-shell advice.
+/// Falls back to POSIX generic instructions for unknown/missing shells.
+/// This avoids hard-coding zsh/bash assumptions for fish, nushell, elvish, etc.
+#[cfg(unix)]
+fn path_setup_instructions(cargo_bin: &str) -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell_name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    match shell_name {
+        "zsh" => vec![
+            "Add to ~/.zprofile (login shell — read by non-interactive shells too):".to_owned(),
+            format!(r#"  export PATH="{cargo_bin}:$PATH""#),
+            "Reload: source ~/.zprofile  or open a new terminal".to_owned(),
+        ],
+        "bash" => vec![
+            "Add to ~/.bash_profile (or ~/.profile if that file doesn't exist):".to_owned(),
+            format!(r#"  export PATH="{cargo_bin}:$PATH""#),
+            "Reload: source ~/.bash_profile  or open a new terminal".to_owned(),
+        ],
+        "fish" => vec![
+            "Run once in fish to permanently add Cargo's bin to PATH:".to_owned(),
+            format!("  fish_add_path {cargo_bin}"),
+            "(fish_add_path writes to universal variables — no file edit needed)".to_owned(),
+        ],
+        "nu" | "nush" | "nushell" => vec![
+            "Add to ~/.config/nushell/env.nu:".to_owned(),
+            format!(r#"  $env.PATH = ($env.PATH | split row (char esep) | append "{cargo_bin}")"#),
+            "Then restart nushell or run: source ~/.config/nushell/env.nu".to_owned(),
+        ],
+        _ => vec![
+            format!("Add {cargo_bin} to your shell's PATH (consult your shell's documentation)."),
+            "For POSIX shells (sh, dash, ksh, etc.) add to ~/.profile:".to_owned(),
+            format!(r#"  export PATH="{cargo_bin}:$PATH""#),
+            "Then open a new terminal or reload your profile.".to_owned(),
+        ],
+    }
+}
+
+/// Return advice on where jq PATH must be exported for non-interactive sh invocations.
+/// Claude Code hooks are spawned as login-shell children; they see login-profile PATH,
+/// not interactive-shell PATH (.zshrc, .bashrc). The advice is shell-specific.
+#[cfg(unix)]
+fn jq_path_profile_hint() -> String {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let shell_name = std::path::Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    match shell_name {
+        "zsh" => {
+            "If jq is installed but not detected, ensure it is exported in ~/.zprofile,\n  not only in ~/.zshrc (which is not sourced by non-interactive shells).".to_owned()
+        }
+        "bash" => {
+            "If jq is installed but not detected, ensure it is exported in ~/.bash_profile\n  or ~/.profile, not only in ~/.bashrc.".to_owned()
+        }
+        "fish" => {
+            "If jq is installed but not detected, run: fish_add_path $(which jq | xargs dirname)\n  (fish universal PATH is inherited by subprocesses including Claude Code hooks).".to_owned()
+        }
+        _ => {
+            "If jq is installed but not detected, ensure your shell's login profile exports PATH\n  (not only the interactive rc file). Hook subprocesses use the login-shell environment.".to_owned()
+        }
+    }
+}
+
 /// Run pre-flight environment checks before attempting hook installation.
 ///
 /// Checks (in order):
@@ -248,10 +318,9 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
 
     // 2. jq — required only for Script mode (rtk-rewrite.sh guards on it at runtime too).
     //
-    // We use `sh -c "command -v jq"` (POSIX built-in, works on macOS /bin/sh and Linux dash).
-    // This checks the PATH visible to a login-spawned sh, which is the same PATH Claude Code
-    // hooks see. If jq is only exported in an interactive shell profile (e.g. only in .zshrc,
-    // not .zprofile), `sh` may not see it — so we note that possibility in the instructions.
+    // We probe via `sh -c "command -v jq"` — POSIX built-in, works on /bin/sh, bash,
+    // dash, and zsh-as-sh. Claude Code hook subprocesses inherit the same non-interactive
+    // PATH that `sh` sees here, so this is an accurate proxy for hook runtime availability.
     if *hook_type == HookType::Script {
         let jq_found = std::process::Command::new("sh")
             .args(["-c", "command -v jq"])
@@ -260,24 +329,22 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
             .unwrap_or(false);
 
         if !jq_found {
+            let mut instrs = vec![
+                "Install jq using your system package manager:".to_owned(),
+                "  macOS:          brew install jq".to_owned(),
+                "  Ubuntu/Debian:  sudo apt install jq".to_owned(),
+                "  Fedora/RHEL:    sudo dnf install jq".to_owned(),
+                "  Windows (WSL):  sudo apt install jq".to_owned(),
+                jq_path_profile_hint(),
+                "Then re-run: rtk init -g --hook-type script".to_owned(),
+                "Or use the binary hook (no jq needed): rtk init -g --hook-type binary".to_owned(),
+            ];
+            instrs.retain(|s| !s.is_empty());
             issues.push(EnvIssue {
                 severity: IssueSeverity::Hard,
                 problem: "`jq` not found on PATH (required by rtk-rewrite.sh hook script)"
                     .to_owned(),
-                instructions: vec![
-                    "Install jq using your system package manager:".to_owned(),
-                    "  macOS:          brew install jq".to_owned(),
-                    "  Ubuntu/Debian:  sudo apt install jq".to_owned(),
-                    "  Fedora/RHEL:    sudo dnf install jq".to_owned(),
-                    "  Windows (WSL):  sudo apt install jq".to_owned(),
-                    "If jq is already installed but not detected, ensure PATH is exported in"
-                        .to_owned(),
-                    "  ~/.zprofile (macOS) or ~/.profile (Linux), not only in .zshrc/.bashrc."
-                        .to_owned(),
-                    "Then re-run: rtk init -g --hook-type script".to_owned(),
-                    "Or use the binary hook (no jq needed): rtk init -g --hook-type binary"
-                        .to_owned(),
-                ],
+                instructions: instrs,
                 links: vec![
                     "https://jqlang.org/download/",
                     "https://code.claude.com/docs/en/hooks",
@@ -290,9 +357,8 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
     //
     // Two "rtk" packages exist on crates.io:
     //   - rtk-ai/rtk (Rust Token Killer) — has `rtk hook` subcommand
-    //   - reachingforthejack/rtk (Rust Type Kit) — does NOT have `rtk hook`
-    // We probe `rtk hook --help` rather than just `command -v rtk` to catch the
-    // name-collision case: wrong binary on PATH would fail this check.
+    //   - reachingforthejack/rtk (Rust Type Kit) — does NOT
+    // Probe `rtk hook --help` directly (no shell wrapper) to catch the collision.
     let rtk_hook_ok = std::process::Command::new("rtk")
         .args(["hook", "--help"])
         .output()
@@ -301,8 +367,10 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
 
     if !rtk_hook_ok {
         // Distinguish: rtk not on PATH vs wrong rtk binary.
-        let rtk_on_path = std::process::Command::new("sh")
-            .args(["-c", "command -v rtk"])
+        // Use `which rtk` (POSIX, available on macOS and Linux) rather than
+        // `command -v rtk` via sh to avoid spawning an extra shell just for this.
+        let rtk_on_path = std::process::Command::new("which")
+            .arg("rtk")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -316,7 +384,7 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
                         .to_owned(),
                 instructions: vec![
                     "Two packages share the name 'rtk' on crates.io:".to_owned(),
-                    "  ✅ rtk-ai/rtk    (Rust Token Killer — this project)".to_owned(),
+                    "  ✅ rtk-ai/rtk              (Rust Token Killer — this project)".to_owned(),
                     "  ❌ reachingforthejack/rtk  (Rust Type Kit — unrelated)".to_owned(),
                     "Uninstall the wrong one:  cargo uninstall rtk".to_owned(),
                     "Install the correct one:  cargo install --git https://github.com/rtk-ai/rtk"
@@ -327,18 +395,18 @@ fn check_environment(hook_type: &HookType) -> Vec<EnvIssue> {
                 links: vec!["https://github.com/rtk-ai/rtk"],
             });
         } else {
-            // rtk not on PATH at all.
+            // rtk not on PATH at all — give shell-appropriate PATH setup advice.
+            let cargo_bin = dirs::home_dir()
+                .map(|h| h.join(".cargo").join("bin").to_string_lossy().into_owned())
+                .unwrap_or_else(|| "$HOME/.cargo/bin".to_owned());
+            let mut instrs =
+                vec!["Ensure your shell's PATH includes Cargo's bin directory.".to_owned()];
+            instrs.extend(path_setup_instructions(&cargo_bin));
+            instrs.push("Then re-run: rtk init -g".to_owned());
             issues.push(EnvIssue {
                 severity: IssueSeverity::Hard,
                 problem: "`rtk` not found on PATH after installation".to_owned(),
-                instructions: vec![
-                    "Ensure your shell's PATH includes Cargo's bin directory.".to_owned(),
-                    "Add to your shell profile (~/.zprofile on macOS, ~/.profile on Linux):"
-                        .to_owned(),
-                    r#"  export PATH="$HOME/.cargo/bin:$PATH""#.to_owned(),
-                    "Reload: source ~/.zprofile  (or open a new terminal)".to_owned(),
-                    "Then re-run: rtk init -g".to_owned(),
-                ],
+                instructions: instrs,
                 links: vec!["https://doc.rust-lang.org/cargo/getting-started/installation.html"],
             });
         }
