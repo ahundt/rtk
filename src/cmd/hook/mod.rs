@@ -133,7 +133,7 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
             if commands.len() == 1 {
                 let routed = if suffix.is_empty() {
                     // No suffix stripped: use original raw to preserve quoting
-                    route_native_command(&commands[0], raw)
+                    try_route_native_command(&commands[0], raw)
                 } else {
                     // Suffix was stripped: reconstruct core_raw from parsed command.
                     // Quoting is simplified (join with spaces) but acceptable for the
@@ -143,13 +143,19 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
                     } else {
                         format!("{} {}", commands[0].binary, commands[0].args.join(" "))
                     };
-                    route_native_command(&commands[0], &core_raw)
+                    try_route_native_command(&commands[0], &core_raw)
                 };
 
-                if suffix.is_empty() {
-                    HookResult::Rewrite(routed)
-                } else {
-                    HookResult::Rewrite(format!("{} {}", routed, suffix))
+                match routed {
+                    Some(rtk_cmd) => {
+                        if suffix.is_empty() {
+                            HookResult::Rewrite(rtk_cmd)
+                        } else {
+                            HookResult::Rewrite(format!("{} {}", rtk_cmd, suffix))
+                        }
+                    }
+                    // Unknown command — pass through unchanged (no wrapping)
+                    None => HookResult::Rewrite(raw.to_string()),
                 }
             } else {
                 // Multi-command chain (&&, ||, ;): wrap in shell but substitute each
@@ -168,10 +174,7 @@ fn check_for_hook_inner(raw: &str, depth: usize) -> HookResult {
                 HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(&inner)))
             }
         }
-        Err(_) => {
-            // Parse error - passthrough with wrapping
-            HookResult::Rewrite(format!("rtk run -c '{}'", escape_quotes(raw)))
-        }
+        Err(_) => HookResult::Rewrite(raw.to_string()),
     }
 }
 
@@ -421,8 +424,10 @@ pub(crate) fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> 
                 .strip_prefix(prefix)
                 .map(|s| s.trim_start())
                 .unwrap_or(raw);
-            let routed = route_native_command(&real_cmd, core_raw);
-            return format!("{} {}", prefix, routed);
+            return match try_route_native_command(&real_cmd, core_raw) {
+                Some(routed) => format!("{} {}", prefix, routed),
+                None => raw.to_string(), // Unknown cmd — pass through with prefix intact
+            };
         }
         // Bare prefix with no following command — pass through unchanged
         return raw.to_string();
@@ -466,8 +471,10 @@ pub(crate) fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> 
                 args: real_args,
                 operator: cmd.operator.clone(),
             };
-            let routed = route_native_command(&real_cmd, core_raw);
-            return format!("{} {}", env_prefix_str, routed);
+            return match try_route_native_command(&real_cmd, core_raw) {
+                Some(routed) => format!("{} {}", env_prefix_str, routed),
+                None => raw.to_string(), // Unknown cmd — pass through with env prefix intact
+            };
         }
         // All tokens are env assigns (no real command) — fall through to passthrough
     }
@@ -475,9 +482,12 @@ pub(crate) fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> 
     let sub = cmd.args.first().map(String::as_str).unwrap_or("");
     let sub2 = cmd.args.get(1).map(String::as_str).unwrap_or("");
 
+    // Extract basename for full-path binaries: /opt/homebrew/bin/gh → gh
+    let base = cmd.binary.rsplit('/').next().unwrap_or(&cmd.binary);
+
     // 1. Static routing table: O(1) lookup via HashMap (built once at startup).
     //    Covers all simple cases: direct routes and renames (rg→grep, eslint→lint).
-    if let Some(route) = crate::discover::registry::lookup(&cmd.binary, sub) {
+    if let Some(route) = crate::discover::registry::lookup(base, sub) {
         return if route.rtk_cmd == cmd.binary.as_str() {
             // Direct route (binary name == rtk subcommand): prepend "rtk "
             format!("rtk {raw}")
@@ -490,11 +500,11 @@ pub(crate) fn route_native_command(cmd: &analysis::NativeCommand, raw: &str) -> 
     // 2. Complex cases that require Rust logic and cannot be expressed as table entries.
 
     // cat: blocked by safety rules before reaching here; defensive for RTK_BLOCK_TOKEN_WASTE=0
-    if cmd.binary == "cat" {
-        return replace_first_word(raw, "cat", "rtk read");
+    if base == "cat" {
+        return replace_first_word(raw, &cmd.binary, "rtk read");
     }
 
-    match cmd.binary.as_str() {
+    match base {
         // vitest: bare invocation → rtk vitest run (not rtk vitest)
         "vitest" if sub.is_empty() => "rtk vitest run".to_string(),
         "vitest" => format!("rtk {raw}"),
@@ -655,21 +665,28 @@ mod tests {
 
     #[test]
     fn test_safe_commands_rewrite() {
-        let cases = [
-            ("git status", "rtk git status"), // now routes to optimized subcommand
-            ("ls *.rs", "rtk run"),           // shellism passthrough (glob)
-            (r#"git commit -m "Fix && Bug""#, "rtk git commit"), // quoted &&: single cmd, routes
-            ("FOO=bar echo hello", "rtk run"), // env prefix → shellism
-            ("echo `date`", "rtk run"),       // backticks → shellism
-            ("echo $(date)", "rtk run"),      // subshell → shellism
-            ("echo {a,b}.txt", "rtk run"),    // brace expansion → shellism
-            ("echo 'hello!@#$%^&*()'", "rtk run"), // special chars
-            ("echo '日本語 🎉'", "rtk run"),  // unicode
-            ("cd /tmp && git status", "rtk run"), // chain → rtk run -c
+        // Known commands route to RTK subcommands
+        assert_rewrite("git status", "rtk git status");
+        assert_rewrite(r#"git commit -m "Fix && Bug""#, "rtk git commit"); // quoted &&: single cmd, routes
+
+        // Shell metacharacters still go through rtk run -c (needs_shell detects them)
+        let shell_cases = [
+            ("ls *.rs", "rtk run"),               // glob
+            ("echo `date`", "rtk run"),           // backticks
+            ("echo $(date)", "rtk run"),          // subshell
+            ("echo {a,b}.txt", "rtk run"),        // brace expansion
+            ("cd /tmp && git status", "rtk run"), // chain rewrite
         ];
-        for (input, expected) in cases {
+        for (input, expected) in shell_cases {
             assert_rewrite(input, expected);
         }
+
+        // Single unknown commands pass through unchanged (no wrapping)
+        assert_passthrough("FOO=bar echo hello"); // env prefix + unknown cmd
+        assert_passthrough("echo 'hello!@#$%^&*()'"); // special chars in quotes
+        assert_passthrough("echo '日本語 🎉'"); // unicode in quotes
+        assert_passthrough(&format!("echo {}", "a".repeat(1000))); // very long command
+
         // Chain rewrite preserves operator structure
         match check_for_hook("cd /tmp && git status", "claude") {
             HookResult::Rewrite(cmd) => assert!(
@@ -679,8 +696,6 @@ mod tests {
             ),
             other => panic!("Expected Rewrite for chain, got {:?}", other),
         }
-        // Very long command
-        assert_rewrite(&format!("echo {}", "a".repeat(1000)), "rtk run");
     }
 
     // === ENV VAR PREFIX ROUTING ===
@@ -744,20 +759,20 @@ mod tests {
 
     #[test]
     fn test_env_prefix_unknown_cmd_fallback() {
-        // Unknown command after env prefix → still wraps in rtk run -c (safe passthrough)
-        assert_rewrite("VAR=1 unknown_xyz_abc_cmd", "rtk run");
+        // Unknown command after env prefix → passes through unchanged
+        assert_passthrough("VAR=1 unknown_xyz_abc_cmd");
     }
 
     #[test]
     fn test_env_prefix_npm_still_passthrough() {
-        // npm has no RTK subcommand → falls back to rtk run -c (correct, env preserved in shell)
-        assert_rewrite("NODE_ENV=test npm run test:e2e", "rtk run");
+        // npm has no RTK subcommand → passes through unchanged
+        assert_passthrough("NODE_ENV=test npm run test:e2e");
     }
 
     #[test]
     fn test_env_prefix_docker_compose_passthrough() {
-        // docker compose up has no RTK route → falls back to rtk run -c
-        assert_rewrite("COMPOSE_PROJECT_NAME=test docker compose up -d", "rtk run");
+        // docker compose up has no RTK route → passes through unchanged
+        assert_passthrough("COMPOSE_PROJECT_NAME=test docker compose up -d");
     }
 
     // === GLOBAL OPTIONS (PR #99 parity) ===
@@ -766,6 +781,8 @@ mod tests {
 
     #[test]
     fn test_global_options_not_blocked() {
+        // Commands with global options must NOT be blocked.
+        // They pass through unchanged since routing doesn't strip global options.
         let cases = [
             // Git global options
             "git --no-pager status",
@@ -784,7 +801,7 @@ mod tests {
             "kubectl --context prod describe pod foo",
         ];
         for input in cases {
-            assert_rewrite(input, "rtk run");
+            assert_passthrough(input);
         }
     }
 
@@ -849,7 +866,7 @@ mod tests {
 
     // === COMMANDS THAT PASS THROUGH (builtins/unknown) ===
     // Ported from old hooks/test-rtk-rewrite.sh Section 5.
-    // These are not blocked — they get wrapped in rtk run -c.
+    // These are not blocked — they pass through unchanged (no rtk run -c wrapping).
 
     #[test]
     fn test_builtins_not_blocked() {
@@ -864,7 +881,7 @@ mod tests {
             "wget https://example.com/file",
         ];
         for input in cases {
-            assert_rewrite(input, "rtk run");
+            assert_passthrough(input);
         }
     }
 
@@ -976,6 +993,82 @@ mod tests {
             }
             HookResult::Blocked(_) => panic!("should not be blocked"),
         }
+    }
+
+    // === UNKNOWN COMMAND PASSTHROUGH ===
+    // Unknown commands (not in routing table) should pass through
+    // unchanged instead of being wrapped in `rtk run -c '...'`.
+    // Wrapping adds an extra shell layer for zero token savings and causes
+    // quoting/globbing bugs (e.g. zsh NOMATCH on version strings).
+
+    /// Assert that a command passes through unchanged (no `rtk run -c` wrapping).
+    fn assert_passthrough(input: &str) {
+        match check_for_hook(input, "claude") {
+            HookResult::Rewrite(cmd) => {
+                assert!(
+                    !cmd.contains("rtk run -c"),
+                    "command should NOT be wrapped in rtk run -c, got '{}'",
+                    cmd
+                );
+                assert_eq!(cmd, input, "unknown command should pass through unchanged");
+            }
+            HookResult::Blocked(_) => panic!("Expected passthrough for '{}', got Blocked", input),
+        }
+    }
+
+    #[test]
+    fn test_unknown_command_passthrough() {
+        // gh release is NOT in routing whitelist — should pass through unchanged
+        assert_passthrough("gh release create v0.3.0 --title test");
+    }
+
+    #[test]
+    fn test_full_path_binary_routes_correctly() {
+        // Full-path binary should be recognized via basename extraction
+        assert_rewrite("/opt/homebrew/bin/git status", "rtk git status");
+    }
+
+    #[test]
+    fn test_full_path_unknown_command_passthrough() {
+        assert_passthrough("/opt/homebrew/bin/gh release create v0.3.0");
+    }
+
+    #[test]
+    fn test_env_prefix_unknown_command_passthrough() {
+        assert_passthrough("GH_DEBUG= gh release create v0.3.0");
+    }
+
+    #[test]
+    fn test_noglob_unknown_command_passthrough() {
+        assert_passthrough("noglob gh release create v0.3.0");
+    }
+
+    #[test]
+    fn test_chain_mixed_known_unknown() {
+        // Chains still wrap in rtk run -c, but unknown cmds are preserved inside
+        match check_for_hook("gh release create v1 && git status", "claude") {
+            HookResult::Rewrite(cmd) => {
+                assert!(cmd.contains("rtk run -c"), "chains still need rtk run -c");
+                assert!(cmd.contains("rtk git status"), "known cmd routed");
+                assert!(
+                    cmd.contains("gh release create v1"),
+                    "unknown cmd preserved"
+                );
+            }
+            HookResult::Blocked(_) => panic!("should not be blocked"),
+        }
+    }
+
+    #[test]
+    fn test_gh_release_create_exact_bug_report() {
+        let input = r#"gh release create v0.3.0 --title "ai_session_tools v0.3.0" --notes-file notes/v0.3.0-release.md"#;
+        assert_passthrough(input);
+    }
+
+    #[test]
+    fn test_completely_unknown_binary_passthrough() {
+        // Binaries RTK has never heard of should pass through
+        assert_passthrough("some-custom-tool --flag value");
     }
 
     // === COMPOUND COMMANDS (chained with &&, ||, ;) ===
@@ -1138,9 +1231,8 @@ mod tests {
 
     #[test]
     fn test_suffix_unknown_cmd_still_passthrough() {
-        // Unknown command even with safe suffix → still wraps in rtk run -c
-        let input = "unknown_xyz_cmd 2>&1";
-        assert_rewrite(input, "rtk run");
+        // Unknown command with redirect suffix → passes through unchanged
+        assert_passthrough("unknown_xyz_cmd 2>&1");
     }
 
     #[test]
@@ -1250,9 +1342,9 @@ mod tests {
             HookResult::Blocked(msg) => assert!(msg.contains("loop"), "msg: {}", msg),
             _ => panic!("Expected Blocked at max depth"),
         }
-        // At depth 0 → normal rewrite
+        // At depth 0 → normal rewrite (unknown cmd passes through unchanged)
         match check_for_hook_inner("echo hello", 0) {
-            HookResult::Rewrite(cmd) => assert!(cmd.contains("rtk run")),
+            HookResult::Rewrite(cmd) => assert_eq!(cmd, "echo hello"),
             _ => panic!("Expected Rewrite at depth 0"),
         }
     }
@@ -1457,7 +1549,7 @@ mod tests {
     #[test]
     fn test_routing_subcommand_filter_fallback() {
         // Commands where binary is in ROUTES but subcommand is NOT in the Only list
-        // must fall through to `rtk run -c '...'`.
+        // must pass through unchanged (no wrapping in rtk run -c).
         let cases = [
             "docker build .",            // docker Only: ps, images, logs
             "docker run -it nginx",      // docker Only: ps, images, logs
@@ -1475,7 +1567,7 @@ mod tests {
             "gh repo clone foo/bar",     // gh Only: pr, issue, run
         ];
         for input in cases {
-            assert_rewrite(input, "rtk run -c");
+            assert_passthrough(input);
         }
     }
 
@@ -1498,17 +1590,22 @@ mod tests {
 
     #[test]
     fn test_routing_fallbacks_to_rtk_run() {
-        // Unknown subcommand, chains (2+ cmds), pipes, and binaries with no rtk
-        // equivalent fall back to rtk run -c.
-        let cases = [
-            "git checkout main",              // unknown git subcommand
+        // Chains (2+ cmds) and pipes still fall back to rtk run -c.
+        let chain_cases = [
             "git add . && git commit -m msg", // chain → 2 commands → rtk run -c
             "git log | grep fix",             // pipe → needs_shell → rtk run -c
-            "tail -n 20 file.txt",            // no rtk tail subcommand exists
-            "tail -f server.log",             // no rtk tail subcommand exists
         ];
-        for input in cases {
+        for input in chain_cases {
             assert_rewrite(input, "rtk run -c");
+        }
+        // Single unknown commands pass through unchanged (no wrapping).
+        let passthrough_cases = [
+            "git checkout main", // unknown git subcommand
+            "tail -n 20 file.txt",
+            "tail -f server.log",
+        ];
+        for input in passthrough_cases {
+            assert_passthrough(input);
         }
     }
 
