@@ -69,13 +69,31 @@ rtk gain  # MUST show token savings, not "command not found"
 
 ## Project Initialization
 
+### Which mode to choose?
+
+```
+  Do you want RTK active across ALL Claude Code projects?
+  │
+  ├─ YES → rtk init -g              (recommended)
+  │         Hook + RTK.md (~10 tokens in context)
+  │         Commands auto-rewritten transparently
+  │
+  ├─ YES, minimal → rtk init -g --hook-only
+  │         Hook only, nothing added to CLAUDE.md
+  │         Zero tokens in context
+  │
+  └─ NO, single project → rtk init
+            Local CLAUDE.md only (137 lines)
+            No hook, no global effect
+```
+
 ### Recommended: Global Hook-First Setup
 
 **Best for: All projects, automatic RTK usage**
 
 ```bash
 rtk init -g
-# → Registers "rtk hook claude" in ~/.claude/settings.json
+# → Installs hook to ~/.claude/hooks/rtk-rewrite.sh
 # → Creates ~/.claude/RTK.md (10 lines, meta commands only)
 # → Adds @RTK.md reference to ~/.claude/CLAUDE.md
 # → Prompts: "Patch settings.json? [y/N]"
@@ -94,6 +112,25 @@ rtk init --show  # Check hook is installed and executable
 **What is settings.json?**
 Claude Code's hook registry. RTK adds a PreToolUse hook that rewrites commands transparently. Without this, Claude won't invoke the hook automatically.
 
+```
+  Claude Code          settings.json        rtk-rewrite.sh        RTK binary
+       │                    │                     │                    │
+       │  "git status"      │                     │                    │
+       │ ──────────────────►│                     │                    │
+       │                    │  PreToolUse trigger  │                    │
+       │                    │ ───────────────────►│                    │
+       │                    │                     │  rewrite command   │
+       │                    │                     │  → rtk git status  │
+       │                    │◄────────────────────│                    │
+       │                    │  updated command     │                    │
+       │                    │                                          │
+       │  execute: rtk git status                                      │
+       │ ─────────────────────────────────────────────────────────────►│
+       │                                                               │  filter
+       │  "3 modified, 1 untracked ✓"                                  │
+       │◄──────────────────────────────────────────────────────────────│
+```
+
 **Backup Safety**:
 RTK backs up existing settings.json before changes. Restore if needed:
 ```bash
@@ -111,46 +148,30 @@ rtk init  # Creates ./CLAUDE.md with full RTK instructions (137 lines)
 
 **Token savings**: Instructions loaded only for this project
 
-### Gemini CLI Setup
-
-**Best for: Gemini CLI users wanting the same token optimization**
-
-```bash
-rtk init --gemini
-# → Registers "rtk hook gemini" in ~/.gemini/settings.json
-# → Prompts: "Patch settings.json? [y/N]"
-# → If yes: patches + creates backup (~/.gemini/settings.json.bak)
-
-# Automated alternatives:
-rtk init --gemini --auto-patch    # Patch without prompting
-rtk init --gemini --no-patch      # Print manual instructions instead
-
-# Verify installation
-rtk init --show  # Shows both Claude and Gemini hook status
-```
-
-**Manual setup** (if `rtk init --gemini` isn't available):
-```json
-// Add to ~/.gemini/settings.json
-{
-  "hooks": {
-    "BeforeTool": [{
-      "matcher": "run_shell_command",
-      "hooks": [{ "type": "command", "command": "rtk hook gemini" }]
-    }]
-  }
-}
-```
-
 ### Upgrading from Previous Version
 
-If you previously used `rtk init -g` with the old system (137-line injection):
+#### From old 137-line CLAUDE.md injection (pre-0.22)
 
 ```bash
 rtk init -g  # Automatically migrates to hook-first mode
 # → Removes old 137-line block
 # → Installs hook + RTK.md
 # → Adds @RTK.md reference
+```
+
+#### From old hook with inline logic (pre-0.24) — ⚠️ Breaking Change
+
+RTK 0.24.0 replaced the inline command-detection hook (~200 lines) with a **thin delegator** that calls `rtk rewrite`. The binary now contains the rewrite logic, so adding new commands no longer requires a hook update.
+
+The old hook still works but won't benefit from new rules added in future releases.
+
+```bash
+# Upgrade hook to thin delegator
+rtk init --global
+
+# Verify the new hook is active
+rtk init --show
+# Should show: ✅ Hook: ... (thin delegator, up to date)
 ```
 
 ## Common User Flows
@@ -226,7 +247,7 @@ rtk vitest run
 rtk init -g --uninstall
 
 # What gets removed:
-#   - Hook: RTK entry from ~/.claude/settings.json
+#   - Hook: ~/.claude/hooks/rtk-rewrite.sh
 #   - Context: ~/.claude/RTK.md
 #   - Reference: @RTK.md line from ~/.claude/CLAUDE.md
 #   - Registration: RTK hook entry from settings.json

@@ -71,6 +71,54 @@ $ 3 commits      ←─  Terminal      ←─   Format      ←─   Compact Sta
 4. **Fail-Safe**: If filtering fails, fall back to original output
 5. **Transparent**: Users can always see raw output with `-v` flags
 
+### Hook Architecture (v0.9.5+)
+
+The recommended deployment mode uses a Claude Code PreToolUse hook for 100% transparent command rewriting.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                    Hook-Based Command Rewriting                        │
+└────────────────────────────────────────────────────────────────────────┘
+
+Claude Code             settings.json        rtk-rewrite.sh        RTK binary
+     │                       │                     │                    │
+     │  Bash: "git status"   │                     │                    │
+     │ ─────────────────────►│                     │                    │
+     │                       │  PreToolUse hook    │                    │
+     │                       │ ───────────────────►│                    │
+     │                       │                     │  detect: git       │
+     │                       │                     │  rewrite:          │
+     │                       │                     │  rtk git status    │
+     │                       │◄────────────────────│                    │
+     │                       │  updatedInput        │                    │
+     │                       │                                          │
+     │  execute: rtk git status ────────────────────────────────────────►
+     │                                                                  │  run git
+     │                                                                  │  filter
+     │                                                                  │  track
+     │◄──────────────────────────────────────────────────────────────────
+     │  "3 modified, 1 untracked ✓"    (~10 tokens vs ~200 raw)
+     │
+     │  Claude never sees the rewrite — it only sees optimized output.
+
+Files:
+  ~/.claude/hooks/rtk-rewrite.sh  ← thin delegator (calls `rtk rewrite`, ~50 lines)
+  ~/.claude/settings.json         ← hook registry (PreToolUse registration)
+  ~/.claude/RTK.md                ← minimal context hint (10 lines)
+```
+
+Two hook strategies:
+
+```
+Auto-Rewrite (default)              Suggest (non-intrusive)
+─────────────────────               ────────────────────────
+Hook intercepts command             Hook emits systemMessage hint
+Rewrites before execution           Claude decides autonomously
+100% adoption                       ~70-85% adoption
+Zero context overhead               Minimal context overhead
+Best for: production                Best for: learning / auditing
+```
+
 ---
 
 ## Command Lifecycle
@@ -225,6 +273,10 @@ GO                go_cmd.rs         go test/build/vet      75-90%     ✓
                   golangci_cmd.rs   golangci-lint          85%        ✓
 
 NETWORK           wget_cmd.rs       wget                   85-95%     ✓
+                  curl_cmd.rs       curl                   70%        ✓
+
+INFRA             aws_cmd.rs        aws                    80%        ✓
+                  psql_cmd.rs       psql                   75%        ✓
 
 DEPENDENCIES      deps.rs           deps                   80-90%     ✓
 
@@ -233,6 +285,7 @@ ENVIRONMENT       env_cmd.rs        env                    60-80%     ✓
 SYSTEM            init.rs           init                   N/A        ✓
                   gain.rs           gain                   N/A        ✓
                   config.rs         (internal)             N/A        ✓
+                  rewrite_cmd.rs    rewrite                N/A        ✓
 
 SHARED            utils.rs          Helpers                N/A        ✓
                   filter.rs         Language filters       N/A        ✓
@@ -240,12 +293,12 @@ SHARED            utils.rs          Helpers                N/A        ✓
                   tee.rs            Full output recovery   N/A        ✓
 ```
 
-**Total: 47 modules** (29 command modules + 18 infrastructure modules)
+**Total: 60 modules** (38 command modules + 22 infrastructure modules)
 
 ### Module Count Breakdown
 
-- **Command Modules**: 29 (directly exposed to users)
-- **Infrastructure Modules**: 18 (utils, filter, tracking, tee, config, init, gain, etc.)
+- **Command Modules**: 34 (directly exposed to users)
+- **Infrastructure Modules**: 20 (utils, filter, tracking, tee, config, init, gain, toml_filter, verify_cmd, etc.)
 - **Git Commands**: 7 operations (status, diff, log, add, commit, push, branch/checkout)
 - **JS/TS Tooling**: 8 modules (modern frontend/fullstack development)
 - **Python Tooling**: 3 modules (ruff, pytest, pip)
@@ -1433,6 +1486,6 @@ When implementing a new command, consider:
 
 ---
 
-**Last Updated**: 2026-02-12
-**Architecture Version**: 2.1
-**rtk Version**: 0.18.0
+**Last Updated**: 2026-02-22
+**Architecture Version**: 2.2
+**rtk Version**: 0.28.0

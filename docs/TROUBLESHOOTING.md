@@ -137,8 +137,14 @@ rtk init --show  # Should show "✅ Hook: executable, with guards"
 ```
 
 **Option B: Manual (fallback)**
+```bash
+# Copy hook to Claude Code hooks directory
+mkdir -p ~/.claude/hooks
+cp .claude/hooks/rtk-rewrite.sh ~/.claude/hooks/
+chmod +x ~/.claude/hooks/rtk-rewrite.sh
+```
 
-Add to `~/.claude/settings.json`:
+Then add to `~/.claude/settings.json` (replace `~` with full path):
 ```json
 {
   "hooks": {
@@ -148,7 +154,7 @@ Add to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "rtk hook claude"
+            "command": "/Users/yourname/.claude/hooks/rtk-rewrite.sh"
           }
         ]
       }
@@ -158,58 +164,6 @@ Add to `~/.claude/settings.json`:
 ```
 
 **Note**: Use absolute path in `settings.json`, not `~/.claude/...`
-
----
-
-## Problem: RTK not working in Gemini CLI
-
-### Symptom
-Gemini CLI doesn't use rtk for shell commands, outputs are verbose.
-
-### Checklist
-
-**1. Verify rtk is installed and correct:**
-```bash
-rtk --version
-rtk gain  # Must show stats
-```
-
-**2. Install Gemini hook:**
-```bash
-rtk init --gemini
-# → Registers "rtk hook gemini" in ~/.gemini/settings.json
-# → Restart Gemini CLI
-```
-
-**3. Verify hook is configured:**
-```bash
-rtk init --show  # Should show Gemini hook status
-# Or check manually:
-grep "rtk hook gemini" ~/.gemini/settings.json
-```
-
-**4. Manual setup (fallback):**
-
-Add to `~/.gemini/settings.json`:
-```json
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "rtk hook gemini"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-Then restart Gemini CLI.
 
 ---
 

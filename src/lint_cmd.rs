@@ -1,8 +1,8 @@
+use crate::mypy_cmd;
 use crate::ruff_cmd;
 use crate::tracking;
 use crate::utils::{package_manager_exec, truncate};
 use anyhow::{Context, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
@@ -51,16 +51,43 @@ fn is_python_linter(linter: &str) -> bool {
     matches!(linter, "ruff" | "pylint" | "mypy" | "flake8")
 }
 
-pub fn run(args: &[String], verbose: u8) -> Result<()> {
-    let timer = tracking::TimedExecution::start();
+/// Strip package manager prefixes (npx, bunx, pnpm, pnpm exec, yarn) from args.
+/// Returns the number of args to skip.
+fn strip_pm_prefix(args: &[String]) -> usize {
+    let pm_names = ["npx", "bunx", "pnpm", "yarn"];
+    let mut skip = 0;
+    for arg in args {
+        if pm_names.contains(&arg.as_str()) || arg == "exec" {
+            skip += 1;
+        } else {
+            break;
+        }
+    }
+    skip
+}
 
-    // Detect linter name (first arg if not a path/flag, else default to eslint)
+/// Detect the linter name from args (after stripping PM prefixes).
+/// Returns the linter name and whether it was explicitly specified.
+fn detect_linter(args: &[String]) -> (&str, bool) {
     let is_path_or_flag = args.is_empty()
         || args[0].starts_with('-')
         || args[0].contains('/')
         || args[0].contains('.');
 
-    let linter = if is_path_or_flag { "eslint" } else { &args[0] };
+    if is_path_or_flag {
+        ("eslint", false)
+    } else {
+        (&args[0], true)
+    }
+}
+
+pub fn run(args: &[String], verbose: u8) -> Result<()> {
+    let timer = tracking::TimedExecution::start();
+
+    let skip = strip_pm_prefix(args);
+    let effective_args = &args[skip..];
+
+    let (linter, explicit) = detect_linter(effective_args);
 
     // Python linters use Command::new() directly (they're on PATH via pip/pipx)
     // JS linters use package_manager_exec (npx/pnpm exec)
@@ -77,13 +104,13 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         }
         "ruff" => {
             // Force JSON output for ruff check
-            if !args.contains(&"--output-format".to_string()) {
+            if !effective_args.contains(&"--output-format".to_string()) {
                 cmd.arg("check").arg("--output-format=json");
             }
         }
         "pylint" => {
             // Force JSON2 output for pylint
-            if !args.contains(&"--output-format".to_string()) {
+            if !effective_args.contains(&"--output-format".to_string()) {
                 cmd.arg("--output-format=json2");
             }
         }
@@ -96,11 +123,11 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
     }
 
     // Add user arguments (skip first if it was the linter name, and skip "check" for ruff if we added it)
-    let start_idx = if is_path_or_flag {
+    let start_idx = if !explicit {
         0
-    } else if linter == "ruff" && !args.is_empty() && args[0] == "ruff" {
+    } else if linter == "ruff" && !effective_args.is_empty() && effective_args[0] == "ruff" {
         // Skip "ruff" and "check" if we already added "check"
-        if args.len() > 1 && args[1] == "check" {
+        if effective_args.len() > 1 && effective_args[1] == "check" {
             2
         } else {
             1
@@ -109,7 +136,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         1
     };
 
-    for arg in &args[start_idx..] {
+    for arg in &effective_args[start_idx..] {
         // Skip --output-format if we already added it
         if linter == "ruff" && arg.starts_with("--output-format") {
             continue;
@@ -122,7 +149,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 
     // Default to current directory if no path specified (for ruff/pylint/mypy/eslint)
     if matches!(linter, "ruff" | "pylint" | "mypy" | "eslint") {
-        let has_path = args
+        let has_path = effective_args
             .iter()
             .skip(start_idx)
             .any(|a| !a.starts_with('-') && !a.contains('='));
@@ -169,7 +196,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
             }
         }
         "pylint" => filter_pylint_json(&stdout),
-        "mypy" => filter_mypy_output(&raw),
+        "mypy" => mypy_cmd::filter_mypy_output(&raw),
         _ => filter_generic_lint(&raw),
     };
 
@@ -189,6 +216,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         &raw,
         &filtered,
     );
+
+    if !output.status.success() {
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
 
     Ok(())
 }
@@ -402,124 +433,6 @@ fn filter_pylint_json(output: &str) -> String {
     result.trim().to_string()
 }
 
-/// Filter mypy text output - parse and group by error code and file
-fn filter_mypy_output(output: &str) -> String {
-    // Regex pattern: path/to/file.py:line: error: message [error-code]
-    let re = Regex::new(r"^(.+\.py):(\d+): (error|warning|note): (.+?) \[(.+?)\]").unwrap();
-
-    let mut issues: Vec<(String, String, String, String)> = Vec::new(); // (file, line, level, code)
-    let mut errors = 0;
-    let mut warnings = 0;
-    let mut notes = 0;
-
-    for line in output.lines() {
-        if let Some(caps) = re.captures(line) {
-            let file = caps.get(1).map_or("", |m| m.as_str());
-            let line_num = caps.get(2).map_or("", |m| m.as_str());
-            let level = caps.get(3).map_or("", |m| m.as_str());
-            let code = caps.get(5).map_or("", |m| m.as_str());
-
-            match level {
-                "error" => errors += 1,
-                "warning" => warnings += 1,
-                "note" => notes += 1,
-                _ => {}
-            }
-
-            issues.push((
-                file.to_string(),
-                line_num.to_string(),
-                level.to_string(),
-                code.to_string(),
-            ));
-        }
-    }
-
-    if issues.is_empty() {
-        // Check if mypy output contains "Success" or similar
-        if output.contains("Success") || output.trim().is_empty() {
-            return "✓ Mypy: No issues found".to_string();
-        }
-        // Fallback to generic output if no regex matches
-        return format!("Mypy output:\n{}", truncate(output, 500));
-    }
-
-    // Count unique files
-    let unique_files: std::collections::HashSet<_> = issues.iter().map(|(f, _, _, _)| f).collect();
-    let total_files = unique_files.len();
-
-    // Group by error code
-    let mut by_code: HashMap<String, usize> = HashMap::new();
-    for (_, _, _, code) in &issues {
-        *by_code.entry(code.clone()).or_insert(0) += 1;
-    }
-
-    // Group by file
-    let mut by_file: HashMap<&str, usize> = HashMap::new();
-    for (file, _, _, _) in &issues {
-        *by_file.entry(file.as_str()).or_insert(0) += 1;
-    }
-
-    let mut file_counts: Vec<_> = by_file.iter().collect();
-    file_counts.sort_by(|a, b| b.1.cmp(a.1));
-
-    // Build output
-    let mut result = String::new();
-    result.push_str(&format!(
-        "Mypy: {} issues in {} files\n",
-        issues.len(),
-        total_files
-    ));
-
-    if errors > 0 || warnings > 0 {
-        result.push_str(&format!("  {} errors, {} warnings", errors, warnings));
-        if notes > 0 {
-            result.push_str(&format!(", {} notes", notes));
-        }
-        result.push('\n');
-    }
-
-    result.push_str("═══════════════════════════════════════\n");
-
-    // Show top error codes
-    let mut code_counts: Vec<_> = by_code.iter().collect();
-    code_counts.sort_by(|a, b| b.1.cmp(a.1));
-
-    if !code_counts.is_empty() {
-        result.push_str("Top error codes:\n");
-        for (code, count) in code_counts.iter().take(10) {
-            result.push_str(&format!("  {} ({}x)\n", code, count));
-        }
-        result.push('\n');
-    }
-
-    // Show top files
-    result.push_str("Top files:\n");
-    for (file, count) in file_counts.iter().take(10) {
-        let short_path = compact_path(file);
-        result.push_str(&format!("  {} ({} issues)\n", short_path, count));
-
-        // Show top 3 error codes in this file
-        let mut file_codes: HashMap<String, usize> = HashMap::new();
-        for (_f, _, _, code) in issues.iter().filter(|(f, _, _, _)| f == *file) {
-            *file_codes.entry(code.clone()).or_insert(0) += 1;
-        }
-
-        let mut file_code_counts: Vec<_> = file_codes.iter().collect();
-        file_code_counts.sort_by(|a, b| b.1.cmp(a.1));
-
-        for (code, count) in file_code_counts.iter().take(3) {
-            result.push_str(&format!("    {} ({})\n", code, count));
-        }
-    }
-
-    if file_counts.len() > 10 {
-        result.push_str(&format!("\n... +{} more files\n", file_counts.len() - 10));
-    }
-
-    result.trim().to_string()
-}
-
 /// Filter generic linter output (fallback for non-ESLint linters)
 fn filter_generic_lint(output: &str) -> String {
     let mut warnings = 0;
@@ -694,30 +607,77 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_mypy_no_issues() {
-        let output = "Success: no issues found in 5 source files";
-        let result = filter_mypy_output(output);
-        assert!(result.contains("✓ Mypy"));
-        assert!(result.contains("No issues found"));
+    fn test_strip_pm_prefix_npx() {
+        let args: Vec<String> = vec!["npx".into(), "eslint".into(), "src/".into()];
+        assert_eq!(strip_pm_prefix(&args), 1);
     }
 
     #[test]
-    fn test_filter_mypy_with_errors() {
-        let output = r#"src/main.py:10: error: Incompatible return value type [return-value]
-src/main.py:15: error: Argument 1 has incompatible type "str"; expected "int" [arg-type]
-src/utils.py:20: error: Name "foo" is not defined [name-defined]
-src/utils.py:25: warning: Unused "type: ignore" comment [unused-ignore]
-Found 4 errors in 2 files (checked 5 source files)"#;
+    fn test_strip_pm_prefix_bunx() {
+        let args: Vec<String> = vec!["bunx".into(), "eslint".into(), ".".into()];
+        assert_eq!(strip_pm_prefix(&args), 1);
+    }
 
-        let result = filter_mypy_output(output);
-        assert!(result.contains("4 issues"));
-        assert!(result.contains("2 files"));
-        assert!(result.contains("3 errors, 1 warnings"));
-        assert!(result.contains("return-value"));
-        assert!(result.contains("arg-type"));
-        assert!(result.contains("name-defined"));
-        assert!(result.contains("main.py"));
-        assert!(result.contains("utils.py"));
+    #[test]
+    fn test_strip_pm_prefix_pnpm_exec() {
+        let args: Vec<String> = vec!["pnpm".into(), "exec".into(), "eslint".into()];
+        assert_eq!(strip_pm_prefix(&args), 2);
+    }
+
+    #[test]
+    fn test_strip_pm_prefix_none() {
+        let args: Vec<String> = vec!["eslint".into(), "src/".into()];
+        assert_eq!(strip_pm_prefix(&args), 0);
+    }
+
+    #[test]
+    fn test_strip_pm_prefix_empty() {
+        let args: Vec<String> = vec![];
+        assert_eq!(strip_pm_prefix(&args), 0);
+    }
+
+    #[test]
+    fn test_detect_linter_eslint() {
+        let args: Vec<String> = vec!["eslint".into(), "src/".into()];
+        let (linter, explicit) = detect_linter(&args);
+        assert_eq!(linter, "eslint");
+        assert!(explicit);
+    }
+
+    #[test]
+    fn test_detect_linter_default_on_path() {
+        let args: Vec<String> = vec!["src/".into()];
+        let (linter, explicit) = detect_linter(&args);
+        assert_eq!(linter, "eslint");
+        assert!(!explicit);
+    }
+
+    #[test]
+    fn test_detect_linter_default_on_flag() {
+        let args: Vec<String> = vec!["--max-warnings=0".into()];
+        let (linter, explicit) = detect_linter(&args);
+        assert_eq!(linter, "eslint");
+        assert!(!explicit);
+    }
+
+    #[test]
+    fn test_detect_linter_after_npx_strip() {
+        // Simulates: rtk lint npx eslint src/ → after strip_pm_prefix, args = ["eslint", "src/"]
+        let full_args: Vec<String> = vec!["npx".into(), "eslint".into(), "src/".into()];
+        let skip = strip_pm_prefix(&full_args);
+        let effective = &full_args[skip..];
+        let (linter, _) = detect_linter(effective);
+        assert_eq!(linter, "eslint");
+    }
+
+    #[test]
+    fn test_detect_linter_after_pnpm_exec_strip() {
+        let full_args: Vec<String> =
+            vec!["pnpm".into(), "exec".into(), "biome".into(), "check".into()];
+        let skip = strip_pm_prefix(&full_args);
+        let effective = &full_args[skip..];
+        let (linter, _) = detect_linter(effective);
+        assert_eq!(linter, "biome");
     }
 
     #[test]

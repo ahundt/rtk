@@ -16,7 +16,7 @@ This is a fork with critical fixes for git argument parsing and modern JavaScrip
 
 **Verify correct installation:**
 ```bash
-rtk --version  # Should show "rtk 0.18.1" (or newer)
+rtk --version  # Should show "rtk 0.28.0" (or newer)
 rtk gain       # Should show token savings stats (NOT "command not found")
 ```
 
@@ -226,6 +226,7 @@ rtk gain --history | grep proxy
 | pnpm_cmd.rs | pnpm package manager | Compact dependency trees (70-90% reduction) |
 | ruff_cmd.rs | Ruff linter/formatter | JSON for check, text for format (80%+ reduction) |
 | pytest_cmd.rs | Pytest test runner | State machine text parser (90%+ reduction) |
+| mypy_cmd.rs | Mypy type checker | Group by file/error code (80% reduction) |
 | pip_cmd.rs | pip/uv package manager | JSON parsing, auto-detect uv (70-85% reduction) |
 | go_cmd.rs | Go commands | NDJSON for test, text for build/vet (80-90% reduction) |
 | golangci_cmd.rs | golangci-lint | JSON parsing, group by rule (85% reduction) |
@@ -376,7 +377,7 @@ pub fn execute_with_filter(cmd: &str, args: &[&str]) -> Result<()> {
   - `rtk prisma`: Prisma CLI without ASCII art (88% reduction)
 - **Shared Infrastructure**: utils.rs module for package manager auto-detection
 - **Features**: Exit code preservation, error grouping, consistent formatting
-- **Testing**: Validated on production T3 Stack project (methode-aristote/app)
+- **Testing**: Validated on a production T3 Stack project
 
 ### Python & Go Support (2026-02-12)
 - **Python Commands**: 3 commands for Python development workflows
@@ -508,13 +509,11 @@ hyperfine 'target/release/rtk git log -10' --warmup 3
 **ALWAYS confirm working directory before starting any work**:
 
 ```bash
-pwd  # Verify you're in /Users/florianbruniaux/Sites/rtk-ai/rtk
+pwd  # Verify you're in the rtk project root
 git branch  # Verify correct branch (main, feature/*, etc.)
 ```
 
-**Never assume** which project to work in. RTK shares parent directory with other projects (ccboard, cc-economics).
-
-**Context**: Wrong directory detection was a common friction point in multi-repo environments. Always verify before file operations.
+**Never assume** which project to work in. Always verify before file operations.
 
 ## Avoiding Rabbit Holes
 
@@ -545,16 +544,6 @@ When user provides a numbered plan (QW1-QW4, Phase 1-5, sprint tasks, etc.):
 
 **Why**: Plan-driven execution produces better outcomes than ad-hoc implementation. Structured plans help maintain focus and prevent scope creep.
 
-## Language & Communication
-
-- **User communicates in French**: Respond in French unless explicitly writing English content (docs, code comments, READMEs)
-- **"reprend"**: Resume previous task where it was left off
-- **Be direct**: User prefers direct, factual communication (Bold Guy style - cash, bienveillant, énergique)
-
-**Examples**:
-- ✅ "Ça ne va pas marcher parce que X. Voici ce que je ferais : Y."
-- ✅ "Le test échoue car le regex ne capture pas les commits merge. Fix : ajouter `(?:Merge|commit)`."
-- ❌ "Je pense que peut-être nous pourrions éventuellement envisager de..." (trop verbeux, pas direct)
 
 ## Filter Development Checklist
 

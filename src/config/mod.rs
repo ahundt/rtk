@@ -49,6 +49,10 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
     #[serde(default)]
     pub tee: crate::tee::TeeConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub hooks: HooksConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -128,6 +132,30 @@ impl Default for DiscoveryConfig {
             rules_dirs: vec![],
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+pub struct HooksConfig {
+    /// Commands to exclude from auto-rewrite (e.g. ["curl", "playwright"]).
+    /// Survives `rtk init -g` re-runs since config.toml is user-owned.
+    #[serde(default)]
+    pub exclude_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// Check if telemetry is enabled in config. Returns None if config can't be loaded.
+pub fn telemetry_enabled() -> Option<bool> {
+    Config::load().ok().map(|c| c.telemetry.enabled)
 }
 
 impl Config {
@@ -296,6 +324,8 @@ pub struct ConfigOverlay {
     pub display: Option<DisplayOverlay>,
     pub filters: Option<FilterOverlay>,
     pub discovery: Option<DiscoveryOverlay>,
+    pub telemetry: Option<TelemetryOverlay>,
+    pub hooks: Option<HooksOverlay>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,6 +353,16 @@ pub struct DiscoveryOverlay {
     pub search_dirs: Option<Vec<String>>,
     pub global_dirs: Option<Vec<String>>,
     pub rules_dirs: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TelemetryOverlay {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HooksOverlay {
+    pub exclude_commands: Option<Vec<String>>,
 }
 
 impl ConfigOverlay {
@@ -366,6 +406,16 @@ impl ConfigOverlay {
             }
             if let Some(ref v) = d.rules_dirs {
                 config.discovery.rules_dirs = v.clone();
+            }
+        }
+        if let Some(ref t) = self.telemetry {
+            if let Some(v) = t.enabled {
+                config.telemetry.enabled = v;
+            }
+        }
+        if let Some(ref h) = self.hooks {
+            if let Some(ref v) = h.exclude_commands {
+                config.hooks.exclude_commands = v.clone();
             }
         }
     }
@@ -572,6 +622,11 @@ fn apply_value(config: &mut Config, key: &str, value: &str) -> Result<()> {
         "discovery.rules_dirs" => {
             config.discovery.rules_dirs =
                 value.split(',').map(|s| PathBuf::from(s.trim())).collect();
+        }
+        "telemetry.enabled" => config.telemetry.enabled = value.parse()?,
+        "hooks.exclude_commands" => {
+            config.hooks.exclude_commands =
+                value.split(',').map(|s| s.trim().to_string()).collect();
         }
         _ => return Err(anyhow!("Unknown config key: {key}")),
     }
@@ -1194,6 +1249,74 @@ rules_dirs = ["/custom/rules"]
             dir.to_string_lossy().contains("rtk"),
             "Default rules dir should contain 'rtk': {}",
             dir.display()
+        );
+    }
+
+    // === HooksConfig tests (from hooks-v2 config.rs) ===
+
+    #[test]
+    fn test_hooks_config_deserialize() {
+        let toml = r#"
+[hooks]
+exclude_commands = ["curl", "gh"]
+"#;
+        let config: Config = toml::from_str(toml).expect(
+            "Config with [hooks] section should deserialize — HooksConfig must be in Config struct",
+        );
+        assert_eq!(
+            config.hooks.exclude_commands,
+            vec!["curl", "gh"],
+            "exclude_commands should contain exactly the values from TOML"
+        );
+    }
+
+    #[test]
+    fn test_hooks_config_default_empty() {
+        let config = Config::default();
+        assert!(
+            config.hooks.exclude_commands.is_empty(),
+            "Default HooksConfig should have empty exclude_commands"
+        );
+    }
+
+    #[test]
+    fn test_config_without_hooks_section_is_valid() {
+        let toml = r#"
+[tracking]
+enabled = true
+history_days = 90
+"#;
+        let config: Config = toml::from_str(toml).expect(
+            "Config without [hooks] section should still parse — HooksConfig has #[serde(default)]",
+        );
+        assert!(
+            config.hooks.exclude_commands.is_empty(),
+            "Missing [hooks] section should default to empty exclude_commands"
+        );
+    }
+
+    // === TelemetryConfig tests ===
+
+    #[test]
+    fn test_telemetry_config_default_enabled() {
+        let config = Config::default();
+        assert!(
+            config.telemetry.enabled,
+            "Telemetry should default to enabled"
+        );
+    }
+
+    #[test]
+    fn test_telemetry_config_deserialize_disabled() {
+        let toml = r#"
+[telemetry]
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml)
+            .expect("Config with [telemetry] should deserialize — TelemetryConfig must exist");
+        assert!(
+            !config.telemetry.enabled,
+            "Telemetry should be disabled when TOML sets enabled = false"
         );
     }
 
