@@ -701,6 +701,8 @@ enum HookCommands {
     },
     /// Claude Code JSON protocol handler (reads stdin, writes stdout)
     Claude,
+    /// Gemini CLI JSON protocol handler (reads stdin, writes stdout)
+    Gemini,
 }
 
 #[derive(Subcommand)]
@@ -2041,6 +2043,9 @@ fn main() -> Result<()> {
             }
             HookCommands::Claude => {
                 cmd::hook::claude::run()?;
+            }
+            HookCommands::Gemini => {
+                cmd::hook::gemini::run()?;
             }
         },
 
