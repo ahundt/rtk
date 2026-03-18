@@ -2484,7 +2484,6 @@ fn run_opencode_only_mode(verbose: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]

@@ -1,9 +1,9 @@
+use crate::config;
 use crate::tracking;
-use crate::utils::truncate;
+use crate::utils::{resolved_command, truncate};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 struct Position {
@@ -12,9 +12,11 @@ struct Position {
     filename: String,
     #[serde(rename = "Line")]
     #[serde(default)]
+    #[allow(dead_code)]
     line: usize,
     #[serde(rename = "Column")]
     #[serde(default)]
+    #[allow(dead_code)]
     column: usize,
 }
 
@@ -23,6 +25,7 @@ struct Issue {
     #[serde(rename = "FromLinter")]
     from_linter: String,
     #[serde(rename = "Text")]
+    #[allow(dead_code)]
     text: String,
     #[serde(rename = "Pos")]
     pos: Position,
@@ -37,7 +40,7 @@ struct GolangciOutput {
 pub fn run(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("golangci-lint");
+    let mut cmd = resolved_command("golangci-lint");
 
     // Force JSON output
     let has_format = args
@@ -82,9 +85,21 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
         &filtered,
     );
 
-    // golangci-lint returns exit code 1 when issues found (expected behavior)
-    // Don't exit with error code in that case
-    Ok(())
+    // golangci-lint: exit 0 = clean, exit 1 = lint issues, exit 2+ = config/build error
+    // None = killed by signal (OOM, SIGKILL) — always fatal
+    match output.status.code() {
+        Some(0) | Some(1) => Ok(()),
+        Some(code) => {
+            if !stderr.trim().is_empty() {
+                eprintln!("{}", stderr.trim());
+            }
+            std::process::exit(code);
+        }
+        None => {
+            eprintln!("golangci-lint: killed by signal");
+            std::process::exit(130);
+        }
+    }
 }
 
 /// Filter golangci-lint JSON output - group by linter and file
@@ -98,7 +113,7 @@ fn filter_golangci_json(output: &str) -> String {
             return format!(
                 "golangci-lint (JSON parse failed: {})\n{}",
                 e,
-                truncate(output, 500)
+                truncate(output, config::limits().passthrough_max_chars)
             );
         }
     };

@@ -1,6 +1,6 @@
 use crate::stream::{FilterMode, StdinMode, StreamFilter};
 use crate::tracking;
-use crate::utils::truncate;
+use crate::utils::{resolved_command, truncate};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -42,6 +42,11 @@ fn restore_double_dash_with_raw(args: &[String], raw_args: &[String]) -> Vec<Str
         return args.to_vec();
     }
 
+    // If args already contain `--` (Clap preserved it), no restoration needed
+    if args.iter().any(|a| a == "--") {
+        return args.to_vec();
+    }
+
     // Find `--` in the original command line
     let sep_pos = match raw_args.iter().position(|a| a == "--") {
         Some(pos) => pos,
@@ -69,7 +74,7 @@ where
 {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("cargo");
+    let mut cmd = resolved_command("cargo");
     cmd.arg(subcommand);
 
     let restored_args = restore_double_dash(args);
@@ -1148,7 +1153,7 @@ pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<()> {
     if verbose > 0 {
         eprintln!("cargo passthrough: {:?}", args);
     }
-    let status = Command::new("cargo")
+    let status = resolved_command("cargo")
         .args(args)
         .status()
         .context("Failed to run cargo")?;
@@ -1236,6 +1241,42 @@ mod tests {
         ];
         let result = restore_double_dash_with_raw(&args, &raw);
         assert_eq!(result, vec!["--", "-D", "warnings"]);
+    }
+
+    #[test]
+    fn test_restore_double_dash_clippy_with_package_flags() {
+        // rtk cargo clippy -p my-service -p my-crate -- -D warnings
+        // Clap with trailing_var_arg preserves "--" when args precede it
+        // → clap gives ["-p", "my-service", "-p", "my-crate", "--", "-D", "warnings"]
+        let args: Vec<String> = vec![
+            "-p".into(),
+            "my-service".into(),
+            "-p".into(),
+            "my-crate".into(),
+            "--".into(),
+            "-D".into(),
+            "warnings".into(),
+        ];
+        let raw = vec![
+            "rtk".into(),
+            "cargo".into(),
+            "clippy".into(),
+            "-p".into(),
+            "my-service".into(),
+            "-p".into(),
+            "my-crate".into(),
+            "--".into(),
+            "-D".into(),
+            "warnings".into(),
+        ];
+        let result = restore_double_dash_with_raw(&args, &raw);
+        // Should NOT double the "--"
+        assert_eq!(
+            result,
+            vec!["-p", "my-service", "-p", "my-crate", "--", "-D", "warnings"]
+        );
+        // Verify only one "--" exists
+        assert_eq!(result.iter().filter(|a| *a == "--").count(), 1);
     }
 
     #[test]

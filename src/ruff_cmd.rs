@@ -1,13 +1,15 @@
+use crate::config;
 use crate::tracking;
-use crate::utils::truncate;
+use crate::utils::{resolved_command, truncate};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 struct RuffLocation {
+    #[allow(dead_code)]
     row: usize,
+    #[allow(dead_code)]
     column: usize,
 }
 
@@ -20,7 +22,9 @@ struct RuffFix {
 #[derive(Debug, Deserialize)]
 struct RuffDiagnostic {
     code: String,
+    #[allow(dead_code)]
     message: String,
+    #[allow(dead_code)]
     location: RuffLocation,
     #[allow(dead_code)]
     end_location: Option<RuffLocation>,
@@ -38,7 +42,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 
     let is_format = args.iter().any(|a| a == "format");
 
-    let mut cmd = Command::new("ruff");
+    let mut cmd = resolved_command("ruff");
 
     if is_check {
         // Force JSON output for check command
@@ -122,7 +126,7 @@ pub fn filter_ruff_check_json(output: &str) -> String {
             return format!(
                 "Ruff check (JSON parse failed: {})\n{}",
                 e,
-                truncate(output, 500)
+                truncate(output, config::limits().passthrough_max_chars)
             );
         }
     };

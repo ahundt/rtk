@@ -1,11 +1,10 @@
 use crate::stream::{FilterMode, StdinMode, StreamFilter};
 use crate::tracking;
-use crate::utils::truncate;
+use crate::utils::{resolved_command, truncate};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -122,7 +121,7 @@ impl StreamFilter for GoTestStreamFilter {
 pub fn run_test(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("go");
+    let mut cmd = resolved_command("go");
     cmd.arg("test");
 
     // Force JSON output if not already specified
@@ -170,7 +169,7 @@ pub fn run_test(args: &[String], verbose: u8) -> Result<()> {
 pub fn run_build(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("go");
+    let mut cmd = resolved_command("go");
     cmd.arg("build");
 
     for arg in args {
@@ -223,7 +222,7 @@ pub fn run_build(args: &[String], verbose: u8) -> Result<()> {
 pub fn run_vet(args: &[String], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
-    let mut cmd = Command::new("go");
+    let mut cmd = resolved_command("go");
     cmd.arg("vet");
 
     for arg in args {
@@ -281,7 +280,7 @@ pub fn run_other(args: &[OsString], verbose: u8) -> Result<()> {
     let timer = tracking::TimedExecution::start();
 
     let subcommand = args[0].to_string_lossy();
-    let mut cmd = Command::new("go");
+    let mut cmd = resolved_command("go");
     cmd.arg(&*subcommand);
 
     for arg in &args[1..] {

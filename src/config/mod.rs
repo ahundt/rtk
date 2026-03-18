@@ -153,6 +153,38 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Output limits configuration for filters.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LimitsConfig {
+    /// Max total grep results to show (default: 200)
+    pub grep_max_results: usize,
+    /// Max matches per file in grep output (default: 25)
+    pub grep_max_per_file: usize,
+    /// Max staged/modified files shown in git status (default: 15)
+    pub status_max_files: usize,
+    /// Max untracked files shown in git status (default: 10)
+    pub status_max_untracked: usize,
+    /// Max chars for parser passthrough fallback (default: 2000)
+    pub passthrough_max_chars: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            grep_max_results: 200,
+            grep_max_per_file: 25,
+            status_max_files: 15,
+            status_max_untracked: 10,
+            passthrough_max_chars: 2000,
+        }
+    }
+}
+
+/// Get output limits, falling back to defaults if config can't be loaded.
+pub fn limits() -> LimitsConfig {
+    LimitsConfig::default()
+}
+
 /// Check if telemetry is enabled in config. Returns None if config can't be loaded.
 pub fn telemetry_enabled() -> Option<bool> {
     Config::load().ok().map(|c| c.telemetry.enabled)

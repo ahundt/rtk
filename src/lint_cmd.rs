@@ -1,11 +1,11 @@
+use crate::config;
 use crate::mypy_cmd;
 use crate::ruff_cmd;
 use crate::tracking;
-use crate::utils::{package_manager_exec, truncate};
+use crate::utils::{package_manager_exec, resolved_command, truncate};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Command;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EslintMessage {
@@ -36,11 +36,13 @@ struct PylintDiagnostic {
     module: String,
     #[allow(dead_code)]
     obj: String,
+    #[allow(dead_code)]
     line: usize,
     #[allow(dead_code)]
     column: usize,
     path: String,
     symbol: String, // rule code like "unused-variable"
+    #[allow(dead_code)]
     message: String,
     #[serde(rename = "message-id")]
     message_id: String, // e.g., "W0612"
@@ -89,10 +91,10 @@ pub fn run(args: &[String], verbose: u8) -> Result<()> {
 
     let (linter, explicit) = detect_linter(effective_args);
 
-    // Python linters use Command::new() directly (they're on PATH via pip/pipx)
+    // Python linters use resolved_command() directly (they're on PATH via pip/pipx)
     // JS linters use package_manager_exec (npx/pnpm exec)
     let mut cmd = if is_python_linter(linter) {
-        Command::new(linter)
+        resolved_command(linter)
     } else {
         package_manager_exec(linter)
     };
@@ -235,7 +237,7 @@ fn filter_eslint_json(output: &str) -> String {
             return format!(
                 "ESLint output (JSON parse failed: {})\n{}",
                 e,
-                truncate(output, 500)
+                truncate(output, config::limits().passthrough_max_chars)
             );
         }
     };
@@ -327,7 +329,7 @@ fn filter_pylint_json(output: &str) -> String {
             return format!(
                 "Pylint output (JSON parse failed: {})\n{}",
                 e,
-                truncate(output, 500)
+                truncate(output, config::limits().passthrough_max_chars)
             );
         }
     };
