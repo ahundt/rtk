@@ -19,6 +19,7 @@ use super::constants::{
     PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
+use super::manifest;
 
 // Embedded OpenCode plugin (auto-rewrite)
 const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
@@ -1179,6 +1180,20 @@ fn run_default_mode(
             }
             PatchResult::WouldPatch => {
                 // Cannot happen outside dry_run
+            }
+        }
+    }
+
+    // 5b. Patch plugin caches so RTK is the sole Bash hook responder.
+    // Other plugins that registered a `Bash` matcher would otherwise
+    // race RTK and silently drop our updatedInput (issue #1515). The
+    // manifest records every displaced handler so the runtime hook
+    // forwards to them as fallthrough. Non-fatal on failure: a broken
+    // patch step must not abort the rest of `rtk init`.
+    if !dry_run {
+        if let Err(e) = manifest::patch_plugin_caches(&claude_dir, ctx.verbose) {
+            if ctx.verbose > 0 {
+                eprintln!("Warning: patch_plugin_caches failed: {e}");
             }
         }
     }
