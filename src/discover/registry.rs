@@ -3416,7 +3416,7 @@ mod tests {
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk vitest",
+                        rtk_equivalent: "rtk vitest run",
                         ..
                     }
                 ),
@@ -3463,9 +3463,30 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
-                Some("rtk vitest".into()),
-                "Failed for command: {}",
-                command
+                Some("rtk vitest run".into()),
+                "{command} should inject the required vitest run subcommand",
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_vitest_args_inject_run_without_double_run() {
+        // Issue #361 bug 5: RTK's Vitest command requires the `run`
+        // subcommand, but explicit `vitest run` must not become `run run`.
+        for (cmd, rewritten) in [
+            ("vitest --coverage", "rtk vitest run --coverage"),
+            ("npx vitest tests/unit", "rtk vitest run tests/unit"),
+            ("vitest run --coverage", "rtk vitest run --coverage"),
+            (
+                "npx vitest run --reporter=verbose",
+                "rtk vitest run --reporter=verbose",
+            ),
+            ("pnpm vitest run", "rtk vitest run"),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd} should normalize to exactly one vitest run subcommand",
             );
         }
     }
@@ -3605,7 +3626,7 @@ mod tests {
         );
         assert_eq!(
             rewrite_command_no_prefixes("npm exec vitest", &[]),
-            Some("rtk vitest".to_string()),
+            Some("rtk vitest run".to_string()),
         );
     }
 
