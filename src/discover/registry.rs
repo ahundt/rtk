@@ -4329,4 +4329,51 @@ mod tests {
             Some("rtk git status && rtk cargo test".to_string())
         );
     }
+
+    mod ssh_rewrite_issue_1654 {
+        use super::*;
+
+        #[test]
+        fn test_ssh_routes_to_filter() {
+            // Issue #1654: an SSH TOML filter can pass verification, but the
+            // hook path only reaches it if discovery routes `ssh` to `rtk ssh`.
+            for (cmd, rewritten) in [
+                ("ssh host", "rtk ssh host"),
+                ("ssh root@host uptime", "rtk ssh root@host uptime"),
+                (
+                    "ssh -o ConnectTimeout=5 host echo OK",
+                    "rtk ssh -o ConnectTimeout=5 host echo OK",
+                ),
+            ] {
+                match classify_command(cmd) {
+                    Classification::Supported { rtk_equivalent, .. } => {
+                        assert_eq!(rtk_equivalent, "rtk ssh", "{cmd} should use the SSH filter");
+                    }
+                    other => panic!("{cmd} should classify as rtk ssh, got {other:?}"),
+                }
+                assert_eq!(
+                    rewrite_command_no_prefixes(cmd, &[]),
+                    Some(rewritten.into()),
+                    "{cmd} should rewrite through the SSH filter"
+                );
+            }
+        }
+
+        #[test]
+        fn test_ssh_rule_rejects_lookalike_binaries() {
+            // The rule is for the ssh client, not adjacent tools that begin
+            // with the same letters.
+            for cmd in [
+                "sshpass -p x ssh host",
+                "sshfs host:/ /mnt",
+                "ssh-keygen -l -f key.pub",
+            ] {
+                assert_eq!(
+                    rewrite_command_no_prefixes(cmd, &[]),
+                    None,
+                    "{cmd} is not the ssh client and must not rewrite to rtk ssh"
+                );
+            }
+        }
+    }
 }
