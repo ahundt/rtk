@@ -283,7 +283,14 @@ pub const RULES: &[RtkRule] = &[
     },
     RtkRule {
         pattern: r"^((p?np(m|x)|p?npm\s+(exec|run|run-script)|npm\s+(rum|urn|x)|pnpm\s+dlx)\s+)?vitest(\s+run)?(\s|$)",
-        rtk_cmd: "rtk vitest",
+        // PR B (v3/fix-vitest-run-injection): rtk_cmd must include `run`.
+        // RTK's vitest Clap parser requires the `run` subcommand. Bare
+        // `rtk vitest` exits with code 2 (Clap "subcommand required" error).
+        // Since `rewrite_prefixes` are matched longest-first, both `vitest`
+        // and `vitest run` get stripped to "" and re-prefixed with this value,
+        // producing the correct `rtk vitest run [args]` for both inputs.
+        // See issue #361 bug 5.
+        rtk_cmd: "rtk vitest run",
         rewrite_prefixes: &[
             "npm exec vitest run",
             "npm exec vitest",
