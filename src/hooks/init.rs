@@ -1061,8 +1061,76 @@ fn clean_double_blanks(content: &str) -> String {
     result.join("\n")
 }
 
+/// Parse a semver-like version tuple `(major, minor, patch)` out of a string
+/// containing the literal `rtk-X.Y.Z` or `rtk/X.Y.Z` token (Homebrew Cellar,
+/// versioned install dirs, etc.). Returns `None` if no version token is found.
+///
+/// Ports the semver-aware path matching used by v2's `patch_plugin_caches`
+/// (commit 6fa5d1e) to settings.json hook command strings.
+fn parse_rtk_version_from_path(s: &str) -> Option<(u32, u32, u32)> {
+    use lazy_static::lazy_static;
+    use regex::Regex;
+    lazy_static! {
+        // Match `rtk` followed by `-`, `/`, or `_` then `MAJOR.MINOR.PATCH`.
+        // Anchored to a non-alphanumeric character on the left so we don't
+        // match suffixes inside unrelated names (e.g. `myrtk-1.2.3`).
+        static ref RTK_VERSION_RE: Regex =
+            Regex::new(r"(?:^|[^A-Za-z0-9_])rtk[-_/](\d+)\.(\d+)\.(\d+)").unwrap();
+    }
+    let caps = RTK_VERSION_RE.captures(s)?;
+    let major = caps.get(1)?.as_str().parse().ok()?;
+    let minor = caps.get(2)?.as_str().parse().ok()?;
+    let patch = caps.get(3)?.as_str().parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Parse the current rtk binary's version from `CARGO_PKG_VERSION`. Returns
+/// `(0, 0, 0)` if the env value is malformed (should never happen for a
+/// released build).
+fn current_rtk_version() -> (u32, u32, u32) {
+    let parts: Vec<u32> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    (
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    )
+}
+
+/// Returns true if `cmd` looks like any flavor of rtk hook command:
+/// the legacy `rtk-rewrite.sh` script, the bare `rtk hook claude` command,
+/// or a path-prefixed `…/rtk hook claude` invocation.
+fn is_rtk_hook_command(cmd: &str) -> bool {
+    if cmd.contains(REWRITE_HOOK_FILE) {
+        return true;
+    }
+    if cmd == CLAUDE_HOOK_COMMAND {
+        return true;
+    }
+    // Path-prefixed forms: `/opt/rtk-0.42.0/bin/rtk hook claude`,
+    // `~/.cargo/bin/rtk hook claude`, etc. Match the literal suffix to
+    // avoid false positives on unrelated commands.
+    cmd.ends_with(&format!("/{CLAUDE_HOOK_COMMAND}"))
+}
+
+/// Determine the rtk binary version that a hook command refers to. If the
+/// command string embeds a `rtk-X.Y.Z` token, that version wins; otherwise
+/// fall back to the current build's `CARGO_PKG_VERSION` (the bare
+/// `rtk hook claude` command resolves to whatever rtk is on `$PATH`).
+fn rtk_hook_version(cmd: &str) -> (u32, u32, u32) {
+    parse_rtk_version_from_path(cmd).unwrap_or_else(current_rtk_version)
+}
+
 /// Deep-merge RTK hook entry into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
+///
+/// Per-version dedup (ports v2 commit 6fa5d1e concept to settings.json):
+/// when inserting, strip any pre-existing rtk hook entry whose embedded
+/// `rtk-X.Y.Z` version is strictly older than `hook_command`'s version.
+/// Same- and newer-version entries are preserved (callers should check
+/// `hook_already_present` first to avoid no-op duplicate insertions).
 fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result<()> {
     let root_obj = match root.as_object_mut() {
         Some(obj) => obj,
@@ -1084,6 +1152,28 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
         .as_array_mut()
         .context("PreToolUse value is not an array")?;
 
+    // Per-version dedup: drop entries whose embedded rtk version is older
+    // than the one we're inserting. Untouched: non-rtk hooks, same-version
+    // rtk hooks, newer-version rtk hooks (downgrade prevention).
+    let new_version = rtk_hook_version(hook_command);
+    pre_tool_use.retain(|entry| {
+        let Some(inner_hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
+            return true;
+        };
+        // Keep the entry if any of its inner hook commands is NOT a strictly
+        // older rtk hook. This preserves entries that contain a mix of rtk
+        // and non-rtk handlers (rare, but possible in hand-edited configs).
+        inner_hooks.iter().any(|hook| {
+            let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
+                return true;
+            };
+            if !is_rtk_hook_command(cmd) {
+                return true;
+            }
+            rtk_hook_version(cmd) >= new_version
+        })
+    });
+
     pre_tool_use.push(serde_json::json!({
         "matcher": "Bash",
         "hooks": [{
@@ -1094,8 +1184,13 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
     Ok(())
 }
 
-/// Check if RTK hook is already present in settings.json
-/// Matches on legacy rtk-rewrite.sh path OR new `rtk hook claude` command
+/// Check if RTK hook is already present in settings.json.
+///
+/// Matches on legacy `rtk-rewrite.sh` path, the bare `rtk hook claude`
+/// command, an exact match against `hook_command`, OR any path-prefixed
+/// `…/rtk hook claude` whose embedded version is >= the current build's
+/// version (downgrade prevention: a newer rtk binary's hook entry must
+/// short-circuit re-insertion of an older one).
 fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
     let pre_tool_use_array = match root
         .get("hooks")
@@ -1106,13 +1201,21 @@ fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
         None => return false,
     };
 
+    let new_version = rtk_hook_version(hook_command);
+
     pre_tool_use_array
         .iter()
         .filter_map(|entry| entry.get("hooks")?.as_array())
         .flatten()
         .filter_map(|hook| hook.get("command")?.as_str())
         .any(|cmd| {
-            cmd == hook_command || cmd == CLAUDE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
+            if cmd == hook_command || cmd == CLAUDE_HOOK_COMMAND || cmd.contains(REWRITE_HOOK_FILE)
+            {
+                return true;
+            }
+            // Same- or newer-version path-prefixed rtk hook entries count as
+            // "already present" so the caller does not downgrade them.
+            is_rtk_hook_command(cmd) && rtk_hook_version(cmd) >= new_version
         })
 }
 
@@ -5396,6 +5499,149 @@ mod tests {
 
         // And add hooks
         assert!(json_content.get("hooks").is_some());
+    }
+
+    // Per-version hook dedup tests (PR E: ports v2 commit 6fa5d1e dedup concept).
+    // The donor commit dedups by semver from filesystem paths inside
+    // patch_plugin_caches; the v3 adaptation applies the same idea to
+    // settings.json hook entries that reference different rtk binary paths.
+
+    /// settings.json contains a hook entry for an older rtk binary path
+    /// (`/opt/rtk-0.31.0/bin/rtk hook claude`). When we insert a hook for a
+    /// newer rtk version (matching CARGO_PKG_VERSION at build time), the older
+    /// entry must be removed so only one rtk hook fires per command.
+    #[test]
+    fn test_dedup_removes_older_rtk_version() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/opt/rtk-0.31.0/bin/rtk hook claude"
+                    }]
+                }]
+            }
+        });
+
+        // hook_already_present must report false because the existing entry is
+        // for a strictly older rtk version (0.31.0 < current). This lets the
+        // caller proceed to insert_hook_entry, which then performs the dedup.
+        assert!(
+            !hook_already_present(&json_content, CLAUDE_HOOK_COMMAND),
+            "older rtk version should not block re-insertion"
+        );
+
+        insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
+
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        let commands: Vec<&str> = pre_tool_use
+            .iter()
+            .filter_map(|e| e.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(|h| h.get("command")?.as_str())
+            .collect();
+
+        assert!(
+            !commands.iter().any(|c| c.contains("rtk-0.31.0")),
+            "older rtk-0.31.0 entry should be removed; got: {commands:?}"
+        );
+        assert!(
+            commands.contains(&CLAUDE_HOOK_COMMAND),
+            "new bare CLAUDE_HOOK_COMMAND entry should be present; got: {commands:?}"
+        );
+    }
+
+    /// settings.json already contains an entry for the same rtk version as the
+    /// one being installed. Insert must be idempotent: no duplicate entry and
+    /// no spurious removals. hook_already_present must report true so the
+    /// caller short-circuits.
+    #[test]
+    fn test_dedup_preserves_same_version() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": CLAUDE_HOOK_COMMAND
+                    }]
+                }]
+            }
+        });
+
+        // Snapshot the entry count before any operation.
+        let before_len = json_content["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .len();
+
+        assert!(
+            hook_already_present(&json_content, CLAUDE_HOOK_COMMAND),
+            "same-version entry must short-circuit"
+        );
+
+        // Even if the caller bypasses the short-circuit, insertion must NOT
+        // remove the existing same-version entry (no false dedup).
+        insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
+
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        let same_version_count = pre_tool_use
+            .iter()
+            .filter_map(|e| e.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(|h| h.get("command")?.as_str())
+            .filter(|c| *c == CLAUDE_HOOK_COMMAND)
+            .count();
+        assert!(
+            same_version_count >= 1,
+            "same-version entry must be preserved (not removed by dedup)"
+        );
+        assert!(
+            pre_tool_use.len() >= before_len,
+            "no entries should be silently dropped"
+        );
+    }
+
+    /// settings.json contains a hook entry for a strictly newer rtk version
+    /// than the current binary. Dedup must NOT downgrade: hook_already_present
+    /// must return true so the caller skips insertion entirely, and the newer
+    /// entry must remain untouched.
+    #[test]
+    fn test_dedup_preserves_newer_version() {
+        // Construct a path with a version definitively newer than CARGO_PKG_VERSION.
+        // u32::MAX in the major position is unambiguously greater than any real release.
+        let newer_path = "/opt/rtk-9999.0.0/bin/rtk hook claude";
+        let json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": newer_path
+                    }]
+                }]
+            }
+        });
+
+        assert!(
+            hook_already_present(&json_content, CLAUDE_HOOK_COMMAND),
+            "newer rtk version must satisfy hook_already_present (no downgrade)"
+        );
+
+        // The caller short-circuits on hook_already_present == true, so the
+        // settings.json must be left unchanged.
+        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
+        let commands: Vec<&str> = pre_tool_use
+            .iter()
+            .filter_map(|e| e.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(|h| h.get("command")?.as_str())
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("rtk-9999.0.0")),
+            "newer-version entry must be preserved untouched; got: {commands:?}"
+        );
     }
 
     // Tests for atomic_write()
