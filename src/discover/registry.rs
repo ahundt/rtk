@@ -1969,25 +1969,51 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_docker_run() {
-        assert!(matches!(
-            classify_command("docker run --rm ubuntu bash"),
-            Classification::Supported {
-                rtk_equivalent: "rtk docker",
-                ..
-            }
-        ));
+    fn test_docker_run_exec_passthrough() {
+        // Issue #361 bug 4: docker run/exec can allocate TTYs and consume
+        // stdin, so the hook must not route them through RTK filtering.
+        for cmd in [
+            "docker run --rm ubuntu bash",
+            "docker exec -it mycontainer bash",
+        ] {
+            assert!(
+                matches!(classify_command(cmd), Classification::Unsupported { .. }),
+                "{cmd} should stay unsupported so interactive TTY sessions are not filtered"
+            );
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                None,
+                "{cmd} should execute unchanged"
+            );
+        }
     }
 
     #[test]
-    fn test_classify_docker_exec() {
-        assert!(matches!(
-            classify_command("docker exec -it mycontainer bash"),
-            Classification::Supported {
-                rtk_equivalent: "rtk docker",
-                ..
-            }
-        ));
+    fn test_docker_noninteractive_commands_still_route() {
+        // Regression guard: non-interactive Docker commands still use the
+        // Docker filter and keep their token-saving behavior.
+        for (cmd, rewritten) in [
+            ("docker ps", "rtk docker ps"),
+            ("docker images", "rtk docker images"),
+            ("docker logs mycontainer", "rtk docker logs mycontainer"),
+            ("docker build -t myimage .", "rtk docker build -t myimage ."),
+        ] {
+            assert!(
+                matches!(
+                    classify_command(cmd),
+                    Classification::Supported {
+                        rtk_equivalent: "rtk docker",
+                        ..
+                    }
+                ),
+                "{cmd} should still route through rtk docker"
+            );
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd} should rewrite to the Docker filter"
+            );
+        }
     }
 
     #[test]
@@ -2082,14 +2108,6 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("kubectl describe pod mypod", &[]),
             Some("rtk kubectl describe pod mypod".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_docker_run() {
-        assert_eq!(
-            rewrite_command_no_prefixes("docker run --rm ubuntu bash", &[]),
-            Some("rtk docker run --rm ubuntu bash".into())
         );
     }
 

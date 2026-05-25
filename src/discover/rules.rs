@@ -372,7 +372,9 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
-        pattern: r"^docker\s+(ps|images|logs|run|exec|build|compose\s+(ps|logs|build))",
+        // Issue #361 bug 4: leave interactive run/exec sessions untouched;
+        // route non-interactive inspection/build commands through the filter.
+        pattern: r"^docker\s+(ps|images|logs|build|compose\s+(ps|logs|build))",
         rtk_cmd: "rtk docker",
         rewrite_prefixes: &["docker"],
         category: "Infra",
