@@ -1069,10 +1069,22 @@ const GIT_PUSH_NOISE_PREFIXES: &[&str] = &[
     "Total ",
 ];
 
+// Issue #1581: server-side rejection text must override a masked exit 0.
+const GIT_PUSH_REJECTION_MARKERS: &[&str] = &[
+    "[remote rejected]",
+    "[rejected]",
+    "GH013",
+    "push declined",
+    "pre-receive hook declined",
+    "error: failed to push",
+];
+
 #[derive(Default)]
 struct GitPushLineHandler {
     up_to_date: bool,
     pushed_ref: Option<String>,
+    /// Output showed a rejection, so even exit 0 must not produce an ok summary.
+    rejected: bool,
 }
 
 impl LineHandler for GitPushLineHandler {
@@ -1090,6 +1102,9 @@ impl LineHandler for GitPushLineHandler {
         if line.contains("Everything up-to-date") {
             self.up_to_date = true;
         }
+        if push_output_indicates_rejection(line) {
+            self.rejected = true;
+        }
         if self.pushed_ref.is_none() {
             if let Some(idx) = line.find(" -> ") {
                 let after = &line[idx + 4..];
@@ -1101,7 +1116,7 @@ impl LineHandler for GitPushLineHandler {
     }
 
     fn format_summary(&self, exit_code: i32, _raw: &str) -> Option<String> {
-        if exit_code != 0 {
+        if exit_code != 0 || self.rejected {
             return None;
         }
         let summary = if self.up_to_date {
@@ -1144,7 +1159,19 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
         &result.filtered,
     );
 
+    // Some wrappers or helper configurations can mask a rejected push as exit 0;
+    // surface failure if the raw output contains rejection text.
+    if result.exit_code == 0 && push_output_indicates_rejection(&result.raw) {
+        return Ok(1);
+    }
+
     Ok(result.exit_code)
+}
+
+fn push_output_indicates_rejection(raw: &str) -> bool {
+    GIT_PUSH_REJECTION_MARKERS
+        .iter()
+        .any(|marker| raw.contains(marker))
 }
 
 fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
@@ -2742,6 +2769,17 @@ no changes added to commit (use "git add" and/or "git commit -a")
         out
     }
 
+    fn assert_no_push_ok_summary(result: &str, context: &str) {
+        let leaked: Vec<_> = result
+            .lines()
+            .filter(|line| *line == "ok" || line.starts_with("ok "))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "{context}: leaked push summary lines {leaked:?}; output was:\n{result}"
+        );
+    }
+
     #[test]
     fn test_push_filter_drops_progress_phases() {
         let input = "\
@@ -2800,9 +2838,104 @@ error: failed to push some refs to 'https://github.com/foo/bar.git'
         let result = run_push_filter(input, 1);
         assert!(result.contains("[rejected]"));
         assert!(result.contains("error: failed to push"));
+        assert_no_push_ok_summary(&result, "nonzero rejected push");
+    }
+
+    #[test]
+    fn test_push_filter_no_summary_on_rejected_exit0() {
+        // Issue #1581 variants: these outputs must not leak an ok summary even
+        // when the process exit code is reported as 0.
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "GitHub ruleset rejection",
+                "\
+remote: error: GH013: Repository rule violations found for refs/heads/alpha.
+remote: Review all repository rules at https://github.com/foo/bar/rules.
+remote:
+remote: - Changes must be made through a pull request.
+To https://github.com/foo/bar.git
+ ! [remote rejected] alpha -> alpha (push declined due to repository rule violations)
+error: failed to push some refs to 'https://github.com/foo/bar.git'
+",
+                &["remote rejected", "GH013"],
+            ),
+            (
+                "push declined without GH013",
+                "\
+To https://github.com/foo/bar.git
+ ! [remote rejected] main -> main (push declined due to repository rule violations)
+",
+                &["remote rejected", "push declined"],
+            ),
+            (
+                "generic pre-receive hook decline",
+                "\
+To https://example.com/foo/bar.git
+ ! [remote rejected] feature -> feature (pre-receive hook declined)
+error: failed to push some refs to 'https://example.com/foo/bar.git'
+",
+                &["pre-receive hook declined", "error: failed to push"],
+            ),
+        ];
+
+        for (case, input, expected_visible) in cases {
+            let result = run_push_filter(input, 0);
+            assert_no_push_ok_summary(&result, case);
+            for expected in *expected_visible {
+                assert!(
+                    result.contains(expected),
+                    "{case}: expected visible rejection text {expected:?}; got:\n{result}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_push_output_indicates_rejection_positive_cases() {
+        let cases = [
+            "To https://github.com/foo/bar.git\n ! [remote rejected] alpha -> alpha (push declined due to repository rule violations)\n",
+            "remote: error: GH013: Repository rule violations found\n",
+            " ! [rejected]        main -> main (non-fast-forward)\n",
+            " ! [remote rejected] feature -> feature (pre-receive hook declined)\n",
+            "error: failed to push some refs to 'https://github.com/foo/bar.git'\n",
+            " ! [remote rejected] main -> main (push declined due to repository rule violations)\n",
+        ];
+        for raw in cases {
+            assert!(
+                push_output_indicates_rejection(raw),
+                "expected rejection indicator in: {:?}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_output_indicates_rejection_negative_cases() {
+        let cases = [
+            "Everything up-to-date\n",
+            "To https://github.com/foo/bar.git\n   abc1234..def5678  master -> master\n",
+            "remote: Resolving deltas: 100% (2/2), completed with 2 local objects.\n",
+        ];
+        for raw in cases {
+            assert!(
+                !push_output_indicates_rejection(raw),
+                "false rejection in: {:?}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_filter_emits_summary_when_no_rejection_indicators() {
+        // Regression guard: regular successful push still gets its `ok <ref>` summary.
+        let input = "\
+To https://github.com/foo/bar.git
+   abc1234..def5678  master -> master
+";
+        let result = run_push_filter(input, 0);
         assert!(
-            !result.contains("ok "),
-            "summary leaked on failure, got: {}",
+            result.ends_with("ok master\n"),
+            "expected 'ok master' summary, got: {}",
             result
         );
     }
