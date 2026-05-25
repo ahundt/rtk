@@ -359,6 +359,30 @@ fn split_token_spans(cmd: &str) -> Vec<(&str, usize, usize)> {
     tokens
 }
 
+/// Strip leading bash line-continuations (`\<LF>` or `\<CRLF>`) from a command
+/// string, including any surrounding whitespace. (#1564)
+///
+/// Claude Code formats long invocations as `\<LF>actual cmd`, so the matcher
+/// would otherwise see `\` as the leading token and bail. We strip repeatedly
+/// to tolerate stacked continuations.
+fn strip_leading_line_continuations(cmd: &str) -> &str {
+    let mut s = cmd;
+    loop {
+        let rest = s.trim_start();
+        // A line continuation is a backslash followed immediately by LF or CRLF.
+        if let Some(after_bs) = rest.strip_prefix('\\') {
+            if let Some(after) = after_bs
+                .strip_prefix("\r\n")
+                .or_else(|| after_bs.strip_prefix('\n'))
+            {
+                s = after;
+                continue;
+            }
+        }
+        return rest;
+    }
+}
+
 /// Normalize absolute binary paths: `/usr/bin/grep -rn foo` → `grep -rn foo` (#485)
 /// Only strips if the first word contains a `/` (Unix path).
 fn strip_absolute_path(cmd: &str) -> String {
@@ -464,7 +488,12 @@ pub fn rewrite_command(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Option<String> {
-    let trimmed = cmd.trim();
+    // #1564: Bash line continuations (`\<LF>` or `\<CRLF>`) at the start of a
+    // command are emitted by Claude Code when formatting long invocations. Strip
+    // them before matching so the hook doesn't see a literal `\` as the first
+    // token. Repeat to handle multiple stacked continuations.
+    let stripped = strip_leading_line_continuations(cmd);
+    let trimmed = stripped.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -1282,6 +1311,45 @@ mod tests {
     fn test_rewrite_already_rtk() {
         assert_eq!(
             rewrite_command_no_prefixes("rtk git status", &[]),
+            Some("rtk git status".into())
+        );
+    }
+
+    // --- #1564: leading backslash-newline (bash line continuation) ---
+
+    #[test]
+    fn test_rewrite_leading_line_continuation() {
+        // Claude Code occasionally emits `\<LF>cmd` (line continuation as first
+        // tokens). The matcher must strip the leading `\<LF>` before routing.
+        assert_eq!(
+            rewrite_command_no_prefixes("\\\ngit diff HEAD~1", &[]),
+            Some("rtk git diff HEAD~1".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_leading_line_continuation_crlf() {
+        // Same as above, but with CRLF (Windows / clipboard).
+        assert_eq!(
+            rewrite_command_no_prefixes("\\\r\ngit status", &[]),
+            Some("rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_multiple_leading_line_continuations() {
+        // Multiple stacked continuations should still resolve.
+        assert_eq!(
+            rewrite_command_no_prefixes("\\\n\\\ngit log", &[]),
+            Some("rtk git log".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_leading_line_continuation_with_spaces() {
+        // Leading whitespace before the `\<LF>` should also be tolerated.
+        assert_eq!(
+            rewrite_command_no_prefixes("  \\\n  git status", &[]),
             Some("rtk git status".into())
         );
     }
