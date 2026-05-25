@@ -788,6 +788,20 @@ pub const RULES: &[RtkRule] = &[
         subcmd_savings: &[],
         subcmd_status: &[],
     },
+    // Issue #1654: ssh TOML filter exists in src/filters/ssh.toml but no RtkRule
+    // routed `ssh ...` to `rtk ssh`, so `rtk rewrite` returned exit 1 (passthrough)
+    // and the Claude Code hook never invoked the filter. Use `\s` (not `\b`) so that
+    // longer commands like `sshpass`, `sshfs`, `ssh-keygen`, `ssh-add`, `ssh-keyscan`
+    // do not match this rule.
+    RtkRule {
+        pattern: r"^ssh(?:\s|$)",
+        rtk_cmd: "rtk ssh",
+        rewrite_prefixes: &["ssh"],
+        category: "Network",
+        savings_pct: 85.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
     RtkRule {
         pattern: r"^swift\s+(build|test)\b",
         rtk_cmd: "rtk swift",

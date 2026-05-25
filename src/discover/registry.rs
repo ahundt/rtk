@@ -4101,4 +4101,66 @@ mod tests {
             std::borrow::Cow::<str>::Borrowed("git diff HEAD~1"),
         );
     }
+
+    /// Issue #1654: `ssh` filter passes `rtk verify` but `rtk rewrite` returns exit 1
+    /// because no RtkRule routes `ssh` to `rtk ssh`. Without a rule the hook bypasses
+    /// the TOML filter, leaving every `ssh ...` invocation uncompressed.
+    mod ssh_rewrite_issue_1654 {
+        use super::*;
+
+        #[test]
+        fn test_classify_ssh_simple() {
+            match classify_command("ssh host") {
+                Classification::Supported { rtk_equivalent, .. } => {
+                    assert_eq!(rtk_equivalent, "rtk ssh");
+                }
+                other => panic!("expected Supported('rtk ssh'), got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_classify_ssh_with_user_and_command() {
+            match classify_command("ssh root@host uptime") {
+                Classification::Supported { rtk_equivalent, .. } => {
+                    assert_eq!(rtk_equivalent, "rtk ssh");
+                }
+                other => panic!("expected Supported('rtk ssh'), got {:?}", other),
+            }
+        }
+
+        #[test]
+        fn test_rewrite_ssh_user_host_command() {
+            assert_eq!(
+                rewrite_command_no_prefixes("ssh root@host uptime", &[]),
+                Some("rtk ssh root@host uptime".into())
+            );
+        }
+
+        #[test]
+        fn test_rewrite_ssh_with_options() {
+            assert_eq!(
+                rewrite_command_no_prefixes("ssh -o ConnectTimeout=5 host echo OK", &[]),
+                Some("rtk ssh -o ConnectTimeout=5 host echo OK".into())
+            );
+        }
+
+        #[test]
+        fn test_rewrite_ssh_host_only() {
+            assert_eq!(
+                rewrite_command_no_prefixes("ssh host", &[]),
+                Some("rtk ssh host".into())
+            );
+        }
+
+        #[test]
+        fn test_rewrite_ssh_does_not_match_unrelated_prefixes() {
+            // sshpass is not ssh; must not be rewritten as `rtk ssh ...`
+            assert_eq!(
+                rewrite_command_no_prefixes("sshpass -p x ssh host", &[]),
+                None
+            );
+            // sshfs likewise
+            assert_eq!(rewrite_command_no_prefixes("sshfs host:/ /mnt", &[]), None);
+        }
+    }
 }
