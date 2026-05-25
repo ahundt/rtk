@@ -556,20 +556,13 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe => {
+                // #1560: NEVER rewrite the LHS of a pipe. `rtk <cmd>` reformats
+                // / compresses output, which silently breaks any downstream
+                // pipe consumer (e.g. `ps aux | grep python | grep -v grep`
+                // returned nothing after rewriting). Leave the LHS raw and
+                // only continue rewriting segments after `&&`/`||`/`;`.
                 let seg = cmd[seg_start..tok.offset].trim();
-                let is_pipe_incompatible = seg.starts_with("find ")
-                    || seg == "find"
-                    || seg.starts_with("fd ")
-                    || seg == "fd";
-                let rewritten = if is_pipe_incompatible {
-                    seg.to_string()
-                } else {
-                    rewrite_segment(seg, excluded, transparent_prefixes)
-                        .unwrap_or_else(|| seg.to_string())
-                };
-                if rewritten != seg {
-                    any_changed = true;
-                }
+                let rewritten = seg.to_string();
                 result.push_str(&rewritten);
 
                 let pipe_group_end = tokens.iter().find(|t| {
@@ -1481,10 +1474,11 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_first_only() {
-        // After a pipe, the filter command stays raw
+        // #1560: LHS of a pipe must stay raw — `rtk git log` reformats output
+        // and would break the downstream `grep feat`.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -1494,6 +1488,37 @@ mod tests {
         // is incompatible with pipe consumers like xargs (#439)
         assert_eq!(
             rewrite_command_no_prefixes("find . -name '*.rs' | xargs grep 'fn run'", &[]),
+            None
+        );
+    }
+
+    // --- #1560: never rewrite LHS of a pipe (output format changes break pipe consumers) ---
+
+    #[test]
+    fn test_rewrite_ps_aux_pipe_grep_not_rewritten() {
+        // #1560: `rtk ps aux` compresses output, so the downstream grep
+        // would silently return nothing. Leave the LHS of the pipe alone.
+        assert_eq!(
+            rewrite_command_no_prefixes("ps aux | grep python | grep -v grep", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_git_log_pipe_grep_not_rewritten() {
+        // #1560: `rtk git log` is compressed, downstream `grep` can't filter
+        // the original commit messages reliably.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_cargo_test_pipe_head_not_rewritten() {
+        // #1560: same issue for any LHS of a pipe.
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test | head -5", &[]),
             None
         );
     }
@@ -1671,9 +1696,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
+        // #1560: LHS of pipe stays raw, including its redirect.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | head", &[]),
-            Some("rtk cargo test 2>&1 | head".into())
+            None
         );
     }
 
@@ -3246,18 +3272,19 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // Pipe: rewrite first segment only, pass through rest unchanged
+        // #1560: LHS of pipe stays raw — `rtk cargo test` would compress output.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("rtk cargo test | grep FAILED".into())
+            None
         );
     }
 
     #[test]
     fn test_rewrite_compound_pipe_git_grep() {
+        // #1560: LHS of pipe stays raw — `rtk git log` would compress output.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -3989,52 +4016,58 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_then_and() {
+        // #1560: LHS of pipe stays raw, but `git stash` after `&&` is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("rtk git log | head -5 && rtk git stash".into())
+            Some("git log | head -5 && rtk git stash".into())
         );
     }
 
     #[test]
     fn test_rewrite_pipe_then_semicolon() {
+        // #1560: LHS of pipe stays raw, `git status` after `;` is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("rtk cargo test | head; rtk git status".into())
+            Some("cargo test | head; rtk git status".into())
         );
     }
 
     #[test]
     fn test_rewrite_pipe_then_or() {
+        // #1560: LHS of pipe stays raw, `git stash` after `||` is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("rtk cargo test | grep FAIL || rtk git stash".into())
+            Some("cargo test | grep FAIL || rtk git stash".into())
         );
     }
 
     #[test]
     fn test_rewrite_env_pipe_then_and() {
+        // #1560: LHS of pipe stays raw (with env prefix), `git stash` rewritten.
         assert_eq!(
             rewrite_command_no_prefixes(
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 rtk cargo test 2>&1 | grep FAILED && rtk git stash".into())
+            Some("RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && rtk git stash".into())
         );
     }
 
     #[test]
     fn test_rewrite_and_then_pipe() {
+        // #1560: `git status` before `&&` is rewritten; LHS of pipe stays raw.
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && rtk cargo test | grep FAIL".into())
+            Some("rtk git status && cargo test | grep FAIL".into())
         );
     }
 
     #[test]
     fn test_rewrite_multi_pipe_then_and() {
+        // #1560: pipe chain stays raw, `git status` after `&&` is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("rtk git log | head | tail && rtk git status".into())
+            Some("git log | head | tail && rtk git status".into())
         );
     }
 
