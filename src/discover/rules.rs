@@ -283,7 +283,10 @@ pub const RULES: &[RtkRule] = &[
     },
     RtkRule {
         pattern: r"^((p?np(m|x)|p?npm\s+(exec|run|run-script)|npm\s+(rum|urn|x)|pnpm\s+dlx)\s+)?vitest(\s+run)?(\s|$)",
-        rtk_cmd: "rtk vitest",
+        // Issue #361 bug 5: RTK's Vitest command requires `run`; longest-prefix
+        // stripping keeps explicit `vitest run` inputs from becoming
+        // `rtk vitest run run`.
+        rtk_cmd: "rtk vitest run",
         rewrite_prefixes: &[
             "npm exec vitest run",
             "npm exec vitest",
