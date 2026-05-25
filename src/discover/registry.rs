@@ -1960,21 +1960,47 @@ mod tests {
         ));
     }
 
+    // PR A (v3/fix-docker-run-exec-passthrough): docker run/exec are interactive
+    // commands that allocate a pseudo-TTY (-it flag pattern); filtering them
+    // breaks the terminal session. They must NOT be routed through RTK.
+    // See issue #361 bug 4.
     #[test]
-    fn test_classify_docker_run() {
+    fn test_classify_docker_run_not_routed() {
+        // docker run is interactive (-it allocates TTY) — must NOT be routed
         assert!(matches!(
             classify_command("docker run --rm ubuntu bash"),
+            Classification::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn test_classify_docker_exec_not_routed() {
+        // docker exec is interactive (-it allocates TTY) — must NOT be routed
+        assert!(matches!(
+            classify_command("docker exec -it mycontainer bash"),
+            Classification::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn test_classify_docker_ps_still_routed() {
+        // Regression guard: ps/images/logs are non-interactive and still routed
+        assert!(matches!(
+            classify_command("docker ps"),
             Classification::Supported {
                 rtk_equivalent: "rtk docker",
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn test_classify_docker_exec() {
         assert!(matches!(
-            classify_command("docker exec -it mycontainer bash"),
+            classify_command("docker images"),
+            Classification::Supported {
+                rtk_equivalent: "rtk docker",
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_command("docker logs mycontainer"),
             Classification::Supported {
                 rtk_equivalent: "rtk docker",
                 ..
@@ -2077,11 +2103,32 @@ mod tests {
         );
     }
 
+    // PR A (v3/fix-docker-run-exec-passthrough): docker run/exec rewrite must
+    // return None (passthrough — execute the original command unchanged).
     #[test]
-    fn test_rewrite_docker_run() {
+    fn test_rewrite_docker_run_passthrough() {
         assert_eq!(
             rewrite_command_no_prefixes("docker run --rm ubuntu bash", &[]),
-            Some("rtk docker run --rm ubuntu bash".into())
+            None,
+            "docker run is interactive and must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_docker_exec_passthrough() {
+        assert_eq!(
+            rewrite_command_no_prefixes("docker exec -it mycontainer bash", &[]),
+            None,
+            "docker exec is interactive and must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_docker_ps_still_routed() {
+        // Regression guard: docker ps remains routed
+        assert_eq!(
+            rewrite_command_no_prefixes("docker ps", &[]),
+            Some("rtk docker ps".into())
         );
     }
 
