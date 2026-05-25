@@ -1,4 +1,5 @@
 use super::constants::{CLAUDE_DIR, SETTINGS_JSON, SETTINGS_LOCAL_JSON};
+use super::safety::{self, SafetyResult};
 use crate::core::stream::exec_capture;
 use crate::discover::lexer::split_on_operators;
 use serde_json::Value;
@@ -25,6 +26,44 @@ pub enum PermissionVerdict {
 pub fn check_command(cmd: &str) -> PermissionVerdict {
     let (deny_rules, ask_rules, allow_rules) = load_permission_rules();
     check_command_with_rules(cmd, &deny_rules, &ask_rules, &allow_rules)
+}
+
+/// Combined verdict: safety check runs first, then falls through to the
+/// permission check. Safety can rewrite or block the command before any
+/// permission rule is evaluated.
+///
+/// Currently exposed for hook handlers to opt into incrementally; the
+/// integration tests in this module guard the safety-first ordering.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandVerdict {
+    /// Safety blocked the command — embedded string is the user-facing reason.
+    SafetyBlocked(String),
+    /// Safety rewrote the command — embedded string is the safer command to run.
+    SafetyRewrite(String),
+    /// Safety wants paths moved to trash (rm rewrite). Permission check still
+    /// applies to the resulting `rtk trash <paths>` command.
+    SafetyTrash(Vec<String>),
+    /// Safety was inert; the permission check supplied this verdict.
+    Permission(PermissionVerdict),
+}
+
+/// Run safety BEFORE permission. Safety rules (when their opt-in env var is
+/// set) take precedence and can short-circuit the permission check with a
+/// block, rewrite, or trash request. When safety is inert, the permission
+/// rules are consulted exactly as in [`check_command`].
+///
+/// This is the entry point hook handlers should use once safety integration
+/// rolls out. The existing [`check_command`] remains untouched so callers can
+/// migrate incrementally.
+#[allow(dead_code)]
+pub fn check_command_with_safety(cmd: &str) -> CommandVerdict {
+    match safety::check_raw(cmd) {
+        SafetyResult::Blocked(reason) => CommandVerdict::SafetyBlocked(reason),
+        SafetyResult::Rewritten(new_cmd) => CommandVerdict::SafetyRewrite(new_cmd),
+        SafetyResult::TrashRequested(paths) => CommandVerdict::SafetyTrash(paths),
+        SafetyResult::Safe => CommandVerdict::Permission(check_command(cmd)),
+    }
 }
 
 /// Internal implementation allowing tests to inject rules without file I/O.
@@ -703,5 +742,97 @@ mod tests {
             check_command_with_rules("git status && git push origin main", &[], &ask, &allow),
             PermissionVerdict::Ask
         );
+    }
+
+    // ============================================================
+    // Safety integration tests (check_command_with_safety)
+    // ============================================================
+    //
+    // These guard the invariant: safety runs BEFORE permission.
+    // Env vars are mutated, so each test serialises through the same
+    // process-wide mutex used by the safety-module tests
+    // (super::safety::test_env_lock).
+
+    fn safety_env_lock() -> &'static std::sync::Mutex<()> {
+        super::safety::test_env_lock()
+    }
+
+    fn clear_safety_env() {
+        std::env::remove_var("RTK_SAFE_COMMANDS");
+        std::env::remove_var("RTK_BLOCK_TOKEN_WASTE");
+    }
+
+    #[test]
+    fn test_safety_default_off_falls_through_to_permission() {
+        let _g = safety_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_safety_env();
+        // No env var → safety inert → verdict comes from permissions.
+        let verdict = check_command_with_safety("rm file.txt");
+        assert!(
+            matches!(verdict, CommandVerdict::Permission(_)),
+            "default-off: expected Permission(_) verdict, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn test_safety_blocks_before_permission_when_opted_in() {
+        let _g = safety_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_safety_env();
+        std::env::set_var("RTK_SAFE_COMMANDS", "1");
+        // rm hits safety's check_raw -> Blocked. Must short-circuit even
+        // though no permission rule mentions rm.
+        let verdict = check_command_with_safety("rm file.txt");
+        assert!(
+            matches!(verdict, CommandVerdict::SafetyBlocked(_)),
+            "RTK_SAFE_COMMANDS=1: expected SafetyBlocked, got {verdict:?}"
+        );
+        clear_safety_env();
+    }
+
+    #[test]
+    fn test_safety_fires_before_permission_for_rm() {
+        let _g = safety_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_safety_env();
+        std::env::set_var("RTK_SAFE_COMMANDS", "1");
+        // With RTK_SAFE_COMMANDS=1, rm must be safety-blocked even if a
+        // permission rule would otherwise allow it. Verifies ordering:
+        // safety check runs BEFORE permission check.
+        let verdict = check_command_with_safety("rm /tmp/file.txt");
+        assert!(
+            matches!(verdict, CommandVerdict::SafetyBlocked(_)),
+            "safety must run before permission: got {verdict:?}"
+        );
+        clear_safety_env();
+    }
+
+    #[test]
+    fn test_safety_inert_falls_through_to_permission_default() {
+        let _g = safety_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_safety_env();
+        // No safety env var → safety inert → the permission layer decides.
+        // With no rules at all, expect Permission(Default).
+        let verdict = check_command_with_safety("cat file.txt");
+        assert_eq!(
+            verdict,
+            CommandVerdict::Permission(PermissionVerdict::Default),
+            "without safety env vars, permission layer must decide"
+        );
+    }
+
+    #[test]
+    fn test_safety_does_not_block_cat_in_raw_mode() {
+        let _g = safety_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_safety_env();
+        std::env::set_var("RTK_BLOCK_TOKEN_WASTE", "1");
+        // `suggest_tool` rules (cat/head/sed) deliberately do NOT trigger
+        // via `check_raw` — they would false-positive on legitimate pipeline
+        // uses like `cat file | jq`. Only the parsed `check()` path blocks
+        // them. So at the hook layer we expect Permission(_), not Blocked.
+        let verdict = check_command_with_safety("cat file.txt");
+        assert!(
+            matches!(verdict, CommandVerdict::Permission(_)),
+            "suggest_tool rules must NOT block via check_raw, got {verdict:?}"
+        );
+        clear_safety_env();
     }
 }
