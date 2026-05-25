@@ -812,6 +812,17 @@ pub const RULES: &[RtkRule] = &[
         subcmd_savings: &[],
         subcmd_status: &[],
     },
+    // Issue #1654: route the ssh client to its TOML filter. Require whitespace
+    // or end-of-command so sshpass/sshfs/ssh-keygen do not match.
+    RtkRule {
+        pattern: r"^ssh(?:\s|$)",
+        rtk_cmd: "rtk ssh",
+        rewrite_prefixes: &["ssh"],
+        category: "Network",
+        savings_pct: 85.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
+    },
     RtkRule {
         pattern: r"^swift\s+(build|test)\b",
         rtk_cmd: "rtk swift",
