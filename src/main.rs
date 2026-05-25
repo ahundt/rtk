@@ -23,7 +23,7 @@ use cmds::rust::{cargo_cmd, runner};
 use cmds::scala::sbt_cmd;
 use cmds::system::{
     deps, env_cmd, find_cmd, format_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd, read, search,
-    summary, tree, wc_cmd,
+    summary, tail_cmd, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -260,6 +260,13 @@ enum Commands {
     /// Find files with compact tree output (accepts native find flags like -name, -type)
     Find {
         /// All find arguments (supports both RTK and native find syntax)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Tail files with ANSI stripping, line numbers, and skipped-line summary
+    Tail {
+        /// All tail arguments (passes through to native tail, e.g. -n 50 file.log)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -1878,6 +1885,8 @@ fn run_cli() -> Result<i32> {
             0
         }
 
+        Commands::Tail { args } => tail_cmd::run(&args, cli.verbose)?,
+
         Commands::Diff { file1, file2 } => {
             if let Some(f2) = file2 {
                 diff_cmd::run(&file1, &f2, cli.verbose)?
@@ -2728,6 +2737,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
             | Commands::Deps { .. }
             | Commands::Env { .. }
             | Commands::Find { .. }
+            | Commands::Tail { .. }
             | Commands::Diff { .. }
             | Commands::Log { .. }
             | Commands::Dotnet { .. }

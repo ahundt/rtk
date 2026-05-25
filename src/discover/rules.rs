@@ -103,11 +103,20 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
-        pattern: r"^(cat|head|tail)\s+",
+        pattern: r"^(cat|head)\s+",
         rtk_cmd: "rtk read",
-        rewrite_prefixes: &["cat", "head", "tail"],
+        rewrite_prefixes: &["cat", "head"],
         category: "Files",
         ..RtkRule::DEFAULT
+    },
+    RtkRule {
+        pattern: r"^tail\s+",
+        rtk_cmd: "rtk tail",
+        rewrite_prefixes: &["tail"],
+        category: "Files",
+        savings_pct: 70.0,
+        subcmd_savings: &[],
+        subcmd_status: &[],
     },
     RtkRule {
         pattern: r"^grep\s+",
