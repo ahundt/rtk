@@ -372,7 +372,11 @@ pub const RULES: &[RtkRule] = &[
         subcmd_status: &[],
     },
     RtkRule {
-        pattern: r"^docker\s+(ps|images|logs|run|exec|build|compose\s+(ps|logs|build))",
+        // PR A (v3/fix-docker-run-exec-passthrough): docker run/exec allocate
+        // a pseudo-TTY (-it) and break when filtered through RTK. They must
+        // pass through unchanged. See issue #361 bug 4. `build` remains routed
+        // because it is non-interactive and benefits from output compression.
+        pattern: r"^docker\s+(ps|images|logs|build|compose\s+(ps|logs|build))",
         rtk_cmd: "rtk docker",
         rewrite_prefixes: &["docker"],
         category: "Infra",
