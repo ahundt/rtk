@@ -400,6 +400,9 @@ pub fn run_claude() -> Result<()> {
 
     let input = input.trim();
     if input.is_empty() {
+        // Issue #1773: emit `{}` instead of zero bytes so Claude Code's hook
+        // runner gets valid JSON (interpreted as "no opinion, passthrough").
+        let _ = writeln!(io::stdout(), "{{}}");
         return Ok(());
     }
 
@@ -407,6 +410,9 @@ pub fn run_claude() -> Result<()> {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+            // Issue #1773: still emit valid JSON so the hook runner does not
+            // see zero bytes when input is malformed.
+            let _ = writeln!(io::stdout(), "{{}}");
             return Ok(());
         }
     };
@@ -422,8 +428,17 @@ pub fn run_claude() -> Result<()> {
         }
         PayloadAction::Skip { reason, cmd } => {
             audit_log(reason, &cmd, "");
+            // Issue #1773: commands that RTK does not rewrite (`head -c`,
+            // `sed`, `wc -l`, `yarn test`, etc.) previously produced zero
+            // bytes of stdout, which Claude Code's hook system treats as
+            // a malformed response. Emit `{}` (valid JSON, "no opinion")
+            // so the hook runner proceeds normally.
+            let _ = writeln!(io::stdout(), "{{}}");
         }
-        PayloadAction::Ignore => {}
+        PayloadAction::Ignore => {
+            // Issue #1773: same as Skip — emit `{}` so callers see valid JSON.
+            let _ = writeln!(io::stdout(), "{{}}");
+        }
     }
 
     Ok(())
@@ -435,6 +450,25 @@ fn run_claude_inner(input: &str) -> Option<String> {
     match process_claude_payload(&v) {
         PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
         _ => None,
+    }
+}
+
+/// Issue #1773: Returns the exact JSON string that `run_claude` would write
+/// to stdout for the given raw input. Mirrors the branching in `run_claude`
+/// without performing real I/O so tests can assert on the stdout contract.
+#[cfg(test)]
+fn run_claude_stdout(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "{}\n".to_string();
+    }
+    let v: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return "{}\n".to_string(),
+    };
+    match process_claude_payload(&v) {
+        PayloadAction::Rewrite { output, .. } => format!("{output}\n"),
+        PayloadAction::Skip { .. } | PayloadAction::Ignore => "{}\n".to_string(),
     }
 }
 
@@ -1016,6 +1050,89 @@ mod tests {
     fn test_claude_no_tool_input_passthrough() {
         let input = json!({ "tool_name": "Bash" }).to_string();
         assert!(run_claude_inner(&input).is_none());
+    }
+
+    // --- Issue #1773: never emit empty stdout from `rtk hook claude` ---
+
+    /// Helper: assert that `run_claude_stdout` produces parseable JSON, never
+    /// the empty string. This is the contract Claude Code's hook system relies
+    /// on — zero bytes was misinterpreted as a malformed response.
+    fn assert_emits_valid_json(input: &str, context: &str) {
+        let out = run_claude_stdout(input);
+        assert!(
+            !out.is_empty(),
+            "{}: empty stdout violates Claude Code hook contract",
+            context
+        );
+        // Trailing newline is part of writeln!; strip before parsing.
+        let trimmed = out.trim_end_matches('\n');
+        let _: Value = serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("{}: stdout is not valid JSON: {:?} ({})", context, out, e));
+    }
+
+    #[test]
+    fn test_claude_no_rewrite_emits_empty_object() {
+        // Commands RTK cannot rewrite must still emit valid JSON.
+        let out = run_claude_stdout(&claude_input("head -c 100 /etc/hosts"));
+        assert_eq!(out, "{}\n");
+    }
+
+    #[test]
+    fn test_claude_unknown_command_emits_empty_object() {
+        let out = run_claude_stdout(&claude_input("htop"));
+        assert_eq!(out, "{}\n");
+    }
+
+    #[test]
+    fn test_claude_empty_command_emits_empty_object() {
+        let input = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "" }
+        })
+        .to_string();
+        assert_eq!(run_claude_stdout(&input), "{}\n");
+    }
+
+    #[test]
+    fn test_claude_missing_tool_input_emits_empty_object() {
+        let input = json!({ "tool_name": "Bash" }).to_string();
+        assert_eq!(run_claude_stdout(&input), "{}\n");
+    }
+
+    #[test]
+    fn test_claude_empty_input_emits_empty_object() {
+        assert_eq!(run_claude_stdout(""), "{}\n");
+        assert_eq!(run_claude_stdout("   "), "{}\n");
+        assert_eq!(run_claude_stdout("\n\n"), "{}\n");
+    }
+
+    #[test]
+    fn test_claude_malformed_json_emits_empty_object() {
+        assert_eq!(run_claude_stdout("not valid json {{{"), "{}\n");
+    }
+
+    #[test]
+    fn test_claude_rewrite_still_emits_full_response() {
+        // Regression: rewritable commands must still emit the full hookSpecificOutput.
+        let out = run_claude_stdout(&claude_input("git status"));
+        assert!(out.contains("hookSpecificOutput"));
+        assert!(out.contains("rtk git status"));
+    }
+
+    #[test]
+    fn test_claude_no_rewrite_cases_all_emit_valid_json() {
+        // Issue #1773 lists specific commands. Verify each emits JSON.
+        for cmd in &[
+            "head -c 100 file.txt",
+            "wc -l file.txt",
+            "sed 's/a/b/' file.txt",
+            "yarn test",
+            "npm run build",
+            "htop",
+            "ls -la", // ls IS rewritten, but verify valid JSON regardless
+        ] {
+            assert_emits_valid_json(&claude_input(cmd), &format!("command: {cmd:?}"));
+        }
     }
 
     // --- Cursor handler ---
