@@ -21,7 +21,7 @@ use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
 use cmds::system::{
     deps, env_cmd, find_cmd, format_cmd, grep_cmd, json_cmd, local_llm, log_cmd, ls, pipe_cmd,
-    read, summary, tail_cmd, tree, wc_cmd,
+    read, summary, tail_cmd, trash_cmd, tree, wc_cmd,
 };
 
 use anyhow::{Context, Result};
@@ -108,6 +108,16 @@ enum Commands {
         /// Show line numbers
         #[arg(short = 'n', long)]
         line_numbers: bool,
+    },
+
+    /// Move files to the system trash (safe alternative to rm).
+    ///
+    /// Powers the `rm-to-trash` safety rewrite when RTK_SAFE_COMMANDS=1 is set.
+    /// Mirrors `rm` semantics: silent on success, error message on failure.
+    Trash {
+        /// Paths to move to trash (recoverable from the OS trash bin)
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
     },
 
     /// Generate 2-line technical summary (heuristic-based)
@@ -1486,6 +1496,8 @@ fn run_cli() -> Result<i32> {
             }
         }
 
+        Commands::Trash { paths } => trash_cmd::run(&paths)?,
+
         Commands::Smart {
             file,
             model,
@@ -2510,6 +2522,7 @@ fn is_operational_command(cmd: &Commands) -> bool {
         Commands::Ls { .. }
             | Commands::Tree { .. }
             | Commands::Read { .. }
+            | Commands::Trash { .. }
             | Commands::Smart { .. }
             | Commands::Git { .. }
             | Commands::Gh { .. }

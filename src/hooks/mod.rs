@@ -11,5 +11,12 @@ pub mod manifest;
 pub mod permissions;
 pub mod recursion_guard;
 pub mod rewrite_cmd;
+// Safety policy engine (opt-in via RTK_SAFE_COMMANDS / RTK_BLOCK_TOKEN_WASTE).
+// The public surface is fully tested via #[cfg(test)] but only `check_raw`
+// is currently wired into the live hook path (via permissions.rs::
+// check_command_with_safety). The remaining `pub` items are deliberate hook
+// points for follow-up integration once user-rule discovery lands.
+#[allow(dead_code)]
+pub mod safety;
 pub mod trust;
 pub mod verify_cmd;
