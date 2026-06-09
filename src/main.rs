@@ -15,7 +15,7 @@ use cmds::js::{
     lint_cmd, next_cmd, npm_cmd, playwright_cmd, pnpm_cmd, prettier_cmd, prisma_cmd, tsc_cmd,
     vitest_cmd,
 };
-use cmds::jvm::gradlew_cmd;
+use cmds::jvm::{gradlew_cmd, mvn_cmd};
 use cmds::python::{mypy_cmd, pip_cmd, pytest_cmd, ruff_cmd};
 use cmds::ruby::{rake_cmd, rspec_cmd, rubocop_cmd};
 use cmds::rust::{cargo_cmd, runner};
@@ -736,6 +736,14 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Apache Maven wrapper with compact output (test, integration-test, compile, package, install, verify, deploy)
+    #[command(name = "mvn")]
+    Mvn {
+        /// Maven goals and arguments (e.g., clean install, -DskipTests test, -X)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Show hook rewrite audit metrics (requires RTK_HOOK_AUDIT=1)
     #[command(name = "hook-audit")]
     HookAudit {
@@ -1356,6 +1364,17 @@ fn validate_pnpm_filters(filters: &[String], command: &PnpmCommands) -> Option<S
 }
 
 fn main() {
+    // Reset SIGPIPE to default handler so writing to a closed pipe
+    // e.g `rtk git log | head` exits silently instead of panicking.
+    // Rust ignores SIGPIPE by default and with panic="abort" in the
+    // release profile that becomes SIGABRT + coredump.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    // nosemgrep: unsafe-block
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let code = match run_cli() {
         Ok(code) => code,
         Err(e) => {
@@ -1821,6 +1840,12 @@ fn run_cli() -> Result<i32> {
             };
             if show {
                 hooks::init::show_config(codex)?;
+            } else if uninstall && copilot {
+                if global {
+                    hooks::init::uninstall_copilot_global(ctx)?;
+                } else {
+                    hooks::init::uninstall_copilot(ctx)?;
+                }
             } else if uninstall {
                 uninstall_init_dispatch(
                     agent,
@@ -1841,7 +1866,11 @@ fn run_cli() -> Result<i32> {
                 };
                 hooks::init::run_gemini(global, hook_only, patch_mode, ctx)?;
             } else if copilot {
-                hooks::init::run_copilot(ctx)?;
+                if global {
+                    hooks::init::run_copilot_global(ctx)?;
+                } else {
+                    hooks::init::run_copilot(ctx)?;
+                }
             } else if agent == Some(AgentTarget::Pi) {
                 hooks::init::run_pi_mode(global, ctx)?
             } else if agent == Some(AgentTarget::Kilocode) {
@@ -2168,6 +2197,8 @@ fn run_cli() -> Result<i32> {
         Commands::GolangciLint { args } => golangci_cmd::run(&args, cli.verbose)?,
 
         Commands::Gradlew { args } => gradlew_cmd::run(&args, cli.verbose)?,
+
+        Commands::Mvn { args } => mvn_cmd::run(&args, cli.verbose)?,
 
         Commands::HookAudit { since } => {
             hooks::hook_audit_cmd::run(since, cli.verbose)?;
@@ -3151,6 +3182,40 @@ mod tests {
             }
             _ => panic!("Expected Pnpm Build command"),
         }
+    }
+
+    #[test]
+    #[ignore] // Integration test: requires `cargo build` first
+    fn test_broken_pipe_does_not_crash() {
+        let bin_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("debug")
+            .join("rtk");
+        assert!(
+            bin_path.exists(),
+            "Debug binary not found at {:?} - run `cargo build` first",
+            bin_path
+        );
+
+        let mut child = std::process::Command::new(&bin_path)
+            .args(["git", "log", "--oneline", "-50"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn rtk");
+
+        // Read one byte then drop stdout to close the pipe.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut stdout, &mut buf);
+
+        let status = child.wait().expect("Failed to wait for rtk");
+        let code = status.code().unwrap_or(-1);
+
+        assert_ne!(
+            code, 134,
+            "rtk crashed with SIGABRT (exit 134) on broken pipe - SIGPIPE handler missing"
+        );
     }
 
     #[test]
