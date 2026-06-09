@@ -503,16 +503,24 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    let has_compound = trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains('|')
-        || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !has_compound_operators(trimmed) && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
         return Some(trimmed.to_string());
     }
 
     rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+}
+
+/// Returns `true` if `cmd` contains a real shell compound operator
+/// (`&&`, `||`, `;`, `|`, or background `&`) outside of quoted strings.
+///
+/// Uses the lexer (which is quote-aware) instead of raw `str::contains`,
+/// so quoted operators like `git commit -m "Fix && Bug"` are correctly
+/// treated as data, not as compound operators. See issue #361.
+fn has_compound_operators(cmd: &str) -> bool {
+    tokenize(cmd).iter().any(|t| {
+        matches!(t.kind, TokenKind::Operator | TokenKind::Pipe)
+            || (t.kind == TokenKind::Shellism && t.value == "&")
+    })
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -4186,5 +4194,35 @@ mod tests {
             collapse_line_continuations("git diff HEAD~1"),
             std::borrow::Cow::<str>::Borrowed("git diff HEAD~1"),
         );
+    }
+
+    // PR C / issue #361: compound-fastpath must use the lexer, not raw
+    // string `.contains()`, so quoted shell operators don't trigger the
+    // slow compound rewrite path.
+    #[test]
+    fn test_compound_fastpath_ignores_quoted_operators() {
+        // Double-quoted `&&` inside a commit message is data, not an operator.
+        assert!(
+            !has_compound_operators(r#"git commit -m "Fix && Bug""#),
+            "quoted && inside a string must not be treated as a compound operator"
+        );
+        // Same for ||, ;, |, and the bash background `&` operator.
+        assert!(!has_compound_operators(r#"git commit -m "a || b""#));
+        assert!(!has_compound_operators(r#"git commit -m "end; here""#));
+        assert!(!has_compound_operators(r#"git commit -m "left | right""#));
+        assert!(!has_compound_operators(r#"git commit -m "x & y""#));
+        // Single quotes should also protect operators.
+        assert!(!has_compound_operators(r#"git commit -m 'Fix && Bug'"#));
+
+        // Sanity: real (unquoted) compound operators are still detected.
+        assert!(has_compound_operators("git add . && cargo test"));
+        assert!(has_compound_operators("cmd1 || cmd2"));
+        assert!(has_compound_operators("cmd1 ; cmd2"));
+        assert!(has_compound_operators("git log | head"));
+        assert!(has_compound_operators("cargo test & git status"));
+
+        // A simple non-compound command is not flagged.
+        assert!(!has_compound_operators("git status"));
+        assert!(!has_compound_operators("rtk git status"));
     }
 }
