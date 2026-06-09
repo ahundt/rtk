@@ -2847,11 +2847,13 @@ mod tests {
             "vitest",
         ];
         for command in commands {
+            // PR B (v3/fix-vitest-run-injection): classification reports the
+            // rewrite target, which now includes the required `run` subcommand.
             assert!(
                 matches!(
                     classify_command(command),
                     Classification::Supported {
-                        rtk_equivalent: "rtk vitest",
+                        rtk_equivalent: "rtk vitest run",
                         ..
                     }
                 ),
@@ -2898,11 +2900,45 @@ mod tests {
         for command in commands {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
-                Some("rtk vitest".into()),
-                "Failed for command: {}",
+                Some("rtk vitest run".into()),
+                "Failed for command: {} (PR B: rtk_cmd must inject 'run' subcommand because bare 'rtk vitest' fails Clap validation; see issue #361 bug 5)",
                 command
             );
         }
+    }
+
+    // PR B (v3/fix-vitest-run-injection): bare `vitest` produces broken
+    // `rtk vitest` invocation because RTK's vitest Clap parser requires the
+    // `run` subcommand. The rewrite must inject `run` for both bare `vitest`
+    // and `vitest run` (no double-run). See issue #361 bug 5.
+    #[test]
+    fn test_rewrite_vitest_with_args_injects_run() {
+        // bare vitest with flags → rtk vitest run [flags]
+        assert_eq!(
+            rewrite_command_no_prefixes("vitest --coverage", &[]),
+            Some("rtk vitest run --coverage".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("npx vitest tests/unit", &[]),
+            Some("rtk vitest run tests/unit".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_vitest_run_no_double_run() {
+        // explicit `vitest run` must NOT produce `rtk vitest run run` (Clap fails)
+        assert_eq!(
+            rewrite_command_no_prefixes("vitest run --coverage", &[]),
+            Some("rtk vitest run --coverage".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("npx vitest run --reporter=verbose", &[]),
+            Some("rtk vitest run --reporter=verbose".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("pnpm vitest run", &[]),
+            Some("rtk vitest run".into())
+        );
     }
 
     #[test]
@@ -3038,9 +3074,12 @@ mod tests {
             rewrite_command_no_prefixes("npm run test", &[]),
             Some("rtk npm run test".to_string()),
         );
+        // PR B (v3/fix-vitest-run-injection): `npm exec vitest` now correctly
+        // expands to `rtk vitest run` because RTK's vitest Clap parser
+        // requires the `run` subcommand. See issue #361 bug 5.
         assert_eq!(
             rewrite_command_no_prefixes("npm exec vitest", &[]),
-            Some("rtk vitest".to_string()),
+            Some("rtk vitest run".to_string()),
         );
     }
 
