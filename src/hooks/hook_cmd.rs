@@ -4,7 +4,9 @@
 //! corrupts the JSON protocol (Claude Code bug #4669 silently disables the hook).
 
 use super::constants::PRE_TOOL_USE_KEY;
+use super::manifest::{extract_deny_reason, run_manifest_handlers, ManifestResult};
 use super::permissions::{self, PermissionVerdict};
+use super::recursion_guard::is_rtk_active;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
@@ -12,6 +14,55 @@ use std::io::{self, Read, Write};
 use crate::discover::registry::{has_heredoc, rewrite_command};
 
 const STDIN_CAP: usize = 1_048_576; // 1 MiB
+
+/// Hook decision returned by `run_*_inner` helpers — pure logic, no I/O.
+///
+/// `run_*` functions are the single I/O point per agent (Claude, Cursor,
+/// Gemini, Copilot). They consume a `HookResponse` and emit the
+/// corresponding bytes to stdout/stderr. Combined with `#[deny(
+/// clippy::print_stdout, clippy::print_stderr)]` on the `hook_cmd` module
+/// this prevents stray output from corrupting the JSON hook protocol.
+///
+/// Variants:
+/// - `NoOpinion` — exit 0, no output. Host proceeds as normal. Manifest
+///   fallthrough handlers still run from this branch (RTK had no rewrite
+///   but a displaced plugin may still want to deny).
+/// - `Allow(json)` — exit 0, RTK's rewrite JSON on stdout. Manifest
+///   handlers run as a deny-veto gate before stdout is written.
+/// - `Deny(json, reason)` — exit 2, JSON to stdout, plain-text reason to
+///   stderr. Manifest fallthrough is bypassed (RTK already blocked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookResponse {
+    NoOpinion,
+    Allow(String),
+    /// (json_stdout, plain_text_reason).
+    ///
+    /// Reserved for forthcoming permission integration: today's
+    /// `process_claude_payload` maps a deny verdict to `NoOpinion`
+    /// (matching upstream's documented behaviour), but the dispatcher
+    /// already routes this variant to the exit-2 + dual-path-stderr
+    /// branch so the v3 permission PR can flip the mapping without
+    /// touching `run_claude`.
+    #[allow(dead_code)]
+    Deny(String, String),
+}
+
+/// Returns `true` when hook processing should be skipped entirely.
+///
+/// Two reasons:
+/// - `RTK_HOOK_ENABLED=0` is the user-facing master toggle. Lets
+///   developers disable RTK temporarily (a single shell session, a
+///   single CI job) without uninstalling.
+/// - `RTK_ACTIVE` is set, meaning we are already inside an RTK-spawned
+///   subprocess. Re-hooking would either infinite-loop or double-rewrite
+///   the same command.
+///
+/// The `RTK_HOOK_ENABLED` check compares against the literal `"0"` so
+/// any other value (including `"1"` or empty) keeps hooks active —
+/// avoids accidental disable from a stale `=` line in `~/.zshrc`.
+pub(crate) fn is_hook_disabled() -> bool {
+    std::env::var("RTK_HOOK_ENABLED").as_deref() == Ok("0") || is_rtk_active()
+}
 
 fn read_stdin_limited() -> Result<String> {
     let mut input = String::new();
@@ -42,6 +93,11 @@ enum HookFormat {
 /// Run the Copilot preToolUse hook.
 /// Auto-detects VS Code Copilot Chat vs Copilot CLI format.
 pub fn run_copilot() -> Result<()> {
+    // RTK_HOOK_ENABLED=0 (master toggle) or RTK_ACTIVE (recursion) → skip
+    if is_hook_disabled() {
+        return Ok(());
+    }
+
     let input = read_stdin_limited()?;
 
     // Strip leading BOM(s) before trimming: some Windows hosts prepend UTF-8
@@ -51,12 +107,15 @@ pub fn run_copilot() -> Result<()> {
         return Ok(());
     }
 
+    // FAIL-OPEN: invalid JSON → silent Ok. NEVER write to stderr at exit 0:
+    // Claude Code interprets ANY stderr at exit 0 as a hook error and
+    // proceeds anyway, but worse, ANY stderr corrupts piped JSON consumers
+    // downstream. The previous behavior here emitted a noisy parse error
+    // (bug present at upstream hook_cmd.rs:53) — silent return matches the
+    // Cursor handler at line 421 and the documented fail-open contract.
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
     match detect_format(&v) {
@@ -226,9 +285,25 @@ fn copilot_cli_response_from_decision(
 
 /// Run the Gemini CLI BeforeTool hook.
 pub fn run_gemini() -> Result<()> {
+    // RTK_HOOK_ENABLED=0 (master toggle) or RTK_ACTIVE (recursion) → allow + skip
+    if is_hook_disabled() {
+        print_allow();
+        return Ok(());
+    }
+
     let input = read_stdin_limited()?;
 
-    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+    // FAIL-OPEN: invalid JSON → allow + return (matches the documented
+    // Gemini contract: if our hook misbehaves, the user's tool must
+    // still run). Previously this propagated the parse error which
+    // exited the hook non-zero and silently blocked the tool.
+    let json: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => {
+            print_allow();
+            return Ok(());
+        }
+    };
 
     let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -394,27 +469,19 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     }
 }
 
-/// Run the Claude Code PreToolUse hook natively.
-pub fn run_claude() -> Result<()> {
-    let input = read_stdin_limited()?;
-
-    let input = input.trim();
-    if input.is_empty() {
-        // Issue #1773: emit `{}` instead of zero bytes so Claude Code's hook
-        // runner gets valid JSON (interpreted as "no opinion, passthrough").
-        let _ = writeln!(io::stdout(), "{{}}");
-        return Ok(());
-    }
-
+/// Pure-logic step of `run_claude`. Reads no stdin, writes no output —
+/// `run_claude` performs all I/O so manifest fallthrough can run on both
+/// the NoOpinion and Allow paths without colliding with stdout writes.
+///
+/// Fail-open: any parse or processing failure → `NoOpinion` so the host
+/// tool proceeds normally.
+fn run_claude_inner_v2(input: &str) -> HookResponse {
+    // Silent on parse failure: writing to stderr at exit 0 would be
+    // interpreted by Claude Code as a hook error (and corrupt downstream
+    // JSON consumers). Bug fix vs upstream hook_cmd.rs:368.
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
-            // Issue #1773: still emit valid JSON so the hook runner does not
-            // see zero bytes when input is malformed.
-            let _ = writeln!(io::stdout(), "{{}}");
-            return Ok(());
-        }
+        Err(_) => return HookResponse::NoOpinion,
     };
 
     match process_claude_payload(&v) {
@@ -424,20 +491,110 @@ pub fn run_claude() -> Result<()> {
             output,
         } => {
             audit_log("rewrite", &cmd, &rewritten);
-            let _ = writeln!(io::stdout(), "{output}");
+            HookResponse::Allow(output.to_string())
         }
         PayloadAction::Skip { reason, cmd } => {
             audit_log(reason, &cmd, "");
-            // Issue #1773: commands that RTK does not rewrite (`head -c`,
-            // `sed`, `wc -l`, `yarn test`, etc.) previously produced zero
-            // bytes of stdout, which Claude Code's hook system treats as
-            // a malformed response. Emit `{}` (valid JSON, "no opinion")
-            // so the hook runner proceeds normally.
-            let _ = writeln!(io::stdout(), "{{}}");
+            HookResponse::NoOpinion
         }
-        PayloadAction::Ignore => {
-            // Issue #1773: same as Skip — emit `{}` so callers see valid JSON.
-            let _ = writeln!(io::stdout(), "{{}}");
+        PayloadAction::Ignore => HookResponse::NoOpinion,
+    }
+}
+
+/// Run the Claude Code PreToolUse hook natively.
+///
+/// Architecture (v3): single I/O point. `run_claude_inner_v2` returns a
+/// `HookResponse`; this function dispatches it and runs manifest
+/// fallthrough handlers from BOTH the NoOpinion and Allow paths so a
+/// displaced plugin's deny rules survive RTK's rewrite. See
+/// `manifest::run_manifest_handlers` for the fallthrough contract.
+///
+/// Issue #1773: every NoOpinion exit emits `{}` (valid JSON, "no opinion")
+/// instead of zero bytes. Claude Code's hook runner treats an empty stream
+/// as a malformed response, so the placeholder JSON keeps downstream JSON
+/// consumers happy.
+pub fn run_claude() -> Result<()> {
+    // Master toggle / recursion guard — skip silently if disabled.
+    if is_hook_disabled() {
+        return Ok(());
+    }
+
+    // Read stdin once so the *raw* payload is available for manifest
+    // handlers (they need the original tool_input, not RTK's rewrite).
+    let mut buffer = String::new();
+    io::stdin()
+        .take((STDIN_CAP + 1) as u64)
+        .read_to_string(&mut buffer)
+        .context("Failed to read stdin")?;
+    if buffer.len() > STDIN_CAP {
+        anyhow::bail!("hook stdin exceeds {} byte limit", STDIN_CAP);
+    }
+
+    let trimmed = buffer.trim();
+    if trimmed.is_empty() {
+        // Issue #1773: emit valid JSON so the hook runner does not see
+        // zero bytes when input is empty.
+        let _ = writeln!(io::stdout(), "{{}}");
+        return Ok(());
+    }
+
+    let response = run_claude_inner_v2(trimmed);
+
+    match response {
+        HookResponse::NoOpinion => {
+            // RTK has no rewrite — give every manifest handler a chance.
+            // INVARIANT: pass ORIGINAL buffer (not trimmed) so handlers
+            // see exactly what Claude Code sent. Whitespace tolerance
+            // is the handler's problem to solve.
+            match run_manifest_handlers(&buffer) {
+                ManifestResult::Blocked { json, stderr_bytes } => {
+                    let _ = writeln!(io::stdout(), "{json}");
+                    let _ = io::stderr().write_all(&stderr_bytes);
+                    if stderr_bytes.is_empty() {
+                        let _ = writeln!(io::stderr(), "Command blocked by registered handler");
+                    }
+                    std::process::exit(2);
+                }
+                ManifestResult::NoBlock => {
+                    // Issue #1773: NoOpinion + no manifest block → emit `{}`
+                    // (valid "no opinion" JSON) instead of zero bytes.
+                    let _ = writeln!(io::stdout(), "{{}}");
+                }
+            }
+        }
+        HookResponse::Allow(rtk_json) => {
+            // RTK wants to rewrite. Manifest handlers veto BEFORE we
+            // emit our rewrite so an autorun deny (for example) wins
+            // over a benign RTK rewrite.
+            match run_manifest_handlers(&buffer) {
+                ManifestResult::Blocked {
+                    json: handler_json,
+                    stderr_bytes,
+                } => {
+                    let _ = writeln!(io::stdout(), "{handler_json}");
+                    let _ = io::stderr().write_all(&stderr_bytes);
+                    if stderr_bytes.is_empty() {
+                        let reason = extract_deny_reason(&handler_json).unwrap_or_else(|| {
+                            "Command blocked by registered safety handler".to_owned()
+                        });
+                        let _ = writeln!(io::stderr(), "{reason}");
+                    }
+                    std::process::exit(2);
+                }
+                ManifestResult::NoBlock => {
+                    let _ = writeln!(io::stdout(), "{rtk_json}");
+                }
+            }
+        }
+        HookResponse::Deny(json, reason) => {
+            // Exit 2 path: stderr is the *real* block signal because
+            // Claude Code bug #4669 ignores a deny `permissionDecision`
+            // at exit 0. Dual-path: JSON to stdout (forward-compat),
+            // reason to stderr (works today), exit 2 to trigger the
+            // block.
+            let _ = writeln!(io::stdout(), "{json}");
+            let _ = writeln!(io::stderr(), "{reason}");
+            std::process::exit(2);
         }
     }
 
@@ -488,6 +645,14 @@ fn strip_leading_bom(input: &str) -> &str {
 
 /// Run the Cursor Agent hook natively.
 pub fn run_cursor() -> Result<()> {
+    // Master toggle / recursion guard. Emit `{}` so Cursor renders the
+    // panel as a no-op (matching the empty-input passthrough below)
+    // instead of collapsing to "hook output: {}" with no signal.
+    if is_hook_disabled() {
+        let _ = writeln!(io::stdout(), "{{}}");
+        return Ok(());
+    }
+
     let input = read_stdin_limited()?;
 
     let input = strip_leading_bom(&input).trim();
@@ -1507,5 +1672,156 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["decision"], "deny");
+    }
+
+    // --- HookResponse / is_hook_disabled / run_claude_inner_v2 ---
+    //
+    // These tests serialize via a mutex because they mutate process-wide
+    // env vars. Tests share the lock with `recursion_guard::tests` to
+    // avoid cross-module races on RTK_ACTIVE.
+
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvReset {
+        _lock: MutexGuard<'static, ()>,
+    }
+    impl EnvReset {
+        fn new() -> Self {
+            let lock = env_lock();
+            std::env::remove_var("RTK_HOOK_ENABLED");
+            std::env::remove_var("RTK_ACTIVE");
+            Self { _lock: lock }
+        }
+    }
+    impl Drop for EnvReset {
+        fn drop(&mut self) {
+            std::env::remove_var("RTK_HOOK_ENABLED");
+            std::env::remove_var("RTK_ACTIVE");
+        }
+    }
+
+    #[test]
+    fn test_is_hook_disabled_default_is_false() {
+        let _r = EnvReset::new();
+        assert!(!is_hook_disabled());
+    }
+
+    #[test]
+    fn test_is_hook_disabled_when_rtk_hook_enabled_zero() {
+        let _r = EnvReset::new();
+        std::env::set_var("RTK_HOOK_ENABLED", "0");
+        assert!(is_hook_disabled());
+    }
+
+    #[test]
+    fn test_is_hook_disabled_when_rtk_active_set() {
+        let _r = EnvReset::new();
+        std::env::set_var("RTK_ACTIVE", "1");
+        assert!(is_hook_disabled());
+    }
+
+    #[test]
+    fn test_is_hook_disabled_rtk_hook_enabled_one_is_active() {
+        // Only "0" disables; "1" / anything else keeps the hook running.
+        let _r = EnvReset::new();
+        std::env::set_var("RTK_HOOK_ENABLED", "1");
+        assert!(!is_hook_disabled());
+    }
+
+    #[test]
+    fn test_is_hook_disabled_rtk_hook_enabled_empty_is_active() {
+        // Empty string != "0", so hook stays on. Matches the documented
+        // contract: stale shell exports cannot accidentally disable.
+        let _r = EnvReset::new();
+        std::env::set_var("RTK_HOOK_ENABLED", "");
+        assert!(!is_hook_disabled());
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_no_opinion_on_malformed_json() {
+        // Critical regression test: must NOT write to stderr when JSON
+        // parsing fails. The function returns NoOpinion (no I/O), and
+        // run_claude's NoOpinion path swallows it silently. Mirrors
+        // v2/cmd/hook/claude.rs:264.
+        let response = run_claude_inner_v2("not json at all");
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_no_opinion_on_empty_object() {
+        let response = run_claude_inner_v2("{}");
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_no_opinion_on_missing_tool_input() {
+        let response = run_claude_inner_v2(r#"{"tool_name": "Bash"}"#);
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_no_opinion_when_unmapped_command() {
+        // `htop` has no rtk filter → Skip { reason: "skip:no_match" }
+        // which maps to NoOpinion. Manifest handlers still get a chance
+        // via run_claude's dispatch.
+        let payload = json!({"tool_name": "Bash", "tool_input": {"command": "htop"}}).to_string();
+        let response = run_claude_inner_v2(&payload);
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_allow_when_rewritable() {
+        let payload =
+            json!({"tool_name": "Bash", "tool_input": {"command": "git status"}}).to_string();
+        let response = run_claude_inner_v2(&payload);
+        match response {
+            HookResponse::Allow(json) => {
+                let v: Value = serde_json::from_str(&json).unwrap();
+                let cmd = v
+                    .pointer("/hookSpecificOutput/updatedInput/command")
+                    .and_then(|c| c.as_str())
+                    .unwrap();
+                assert_eq!(cmd, "rtk git status");
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_passthrough_for_already_rtk() {
+        let payload =
+            json!({"tool_name": "Bash", "tool_input": {"command": "rtk git status"}}).to_string();
+        let response = run_claude_inner_v2(&payload);
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_run_claude_inner_v2_passthrough_for_heredoc() {
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat <<EOF\nhello\nEOF"}
+        })
+        .to_string();
+        let response = run_claude_inner_v2(&payload);
+        assert_eq!(response, HookResponse::NoOpinion);
+    }
+
+    #[test]
+    fn test_hook_response_enum_equality() {
+        // Allow trait derivations are wired correctly so the dispatcher
+        // in run_claude can match exhaustively.
+        let a = HookResponse::NoOpinion;
+        let b = HookResponse::Allow("test".into());
+        let c = HookResponse::Deny("json".into(), "reason".into());
+        assert_eq!(a.clone(), HookResponse::NoOpinion);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
     }
 }
