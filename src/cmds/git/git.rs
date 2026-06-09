@@ -1073,6 +1073,11 @@ const GIT_PUSH_NOISE_PREFIXES: &[&str] = &[
 struct GitPushLineHandler {
     up_to_date: bool,
     pushed_ref: Option<String>,
+    /// Issue #1581: Detect server-side rejection patterns in output, even when
+    /// the underlying `git push` exit code is 0 (some wrappers, credential
+    /// helpers, or git config variations suppress the nonzero status). When set,
+    /// `format_summary` must NOT emit a misleading `ok ...` line.
+    rejected: bool,
 }
 
 impl LineHandler for GitPushLineHandler {
@@ -1090,6 +1095,24 @@ impl LineHandler for GitPushLineHandler {
         if line.contains("Everything up-to-date") {
             self.up_to_date = true;
         }
+        // Issue #1581: detect remote/local rejection regardless of exit code.
+        // Patterns from git push stderr (any of these indicates the push failed):
+        //   "! [remote rejected]"     — server-side hook/ruleset rejection
+        //   "! [rejected]"            — local non-fast-forward / pre-push hook
+        //   "[remote rejected]"       — trimmed variant after leading "!"
+        //   "GH013"                   — GitHub repository ruleset violation code
+        //   "push declined"           — accompanies remote rejected (rulesets, hooks)
+        //   "pre-receive hook declined" — server-side hook decline
+        //   "error: failed to push"   — final git error line
+        if line.contains("[remote rejected]")
+            || line.contains("[rejected]")
+            || line.contains("GH013")
+            || line.contains("push declined")
+            || line.contains("pre-receive hook declined")
+            || line.contains("error: failed to push")
+        {
+            self.rejected = true;
+        }
         if self.pushed_ref.is_none() {
             if let Some(idx) = line.find(" -> ") {
                 let after = &line[idx + 4..];
@@ -1101,7 +1124,9 @@ impl LineHandler for GitPushLineHandler {
     }
 
     fn format_summary(&self, exit_code: i32, _raw: &str) -> Option<String> {
-        if exit_code != 0 {
+        // Issue #1581: suppress the `ok ...` summary whenever output indicates
+        // a rejection — even if the upstream exit code is 0.
+        if exit_code != 0 || self.rejected {
             return None;
         }
         let summary = if self.up_to_date {
@@ -1144,7 +1169,27 @@ fn run_push(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32>
         &result.filtered,
     );
 
+    // Issue #1581: If the raw output shows a rejection but the child exit code
+    // is 0 (e.g. wrapper/credential-helper masking), surface exit code 1 so
+    // scripted callers and CI/CD pipelines see the failure.
+    if result.exit_code == 0 && push_output_indicates_rejection(&result.raw) {
+        return Ok(1);
+    }
+
     Ok(result.exit_code)
+}
+
+/// Issue #1581: Returns true when raw push output contains any server-side or
+/// local rejection indicator. Used both to suppress the `ok ...` summary line
+/// and to surface a non-zero exit code from `rtk git push` even if the child
+/// `git push` process exited 0.
+fn push_output_indicates_rejection(raw: &str) -> bool {
+    raw.contains("[remote rejected]")
+        || raw.contains("[rejected]")
+        || raw.contains("GH013")
+        || raw.contains("push declined")
+        || raw.contains("pre-receive hook declined")
+        || raw.contains("error: failed to push")
 }
 
 fn run_pull(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
@@ -2803,6 +2848,131 @@ error: failed to push some refs to 'https://github.com/foo/bar.git'
         assert!(
             !result.contains("ok "),
             "summary leaked on failure, got: {}",
+            result
+        );
+    }
+
+    /// Issue #1581: GitHub repository rulesets reject pushes via remote pre-receive
+    /// hook and produce `! [remote rejected]` plus `GH013` in stderr. Some
+    /// environments (wrappers, credential helpers, certain git versions) report
+    /// exit code 0 while stderr clearly shows the rejection. The filter must
+    /// detect the rejection from output content and suppress the misleading
+    /// `ok (up-to-date)` / `ok <ref>` summary.
+    #[test]
+    fn test_push_filter_no_summary_on_remote_rejected_exit0() {
+        let input = "\
+remote: error: GH013: Repository rule violations found for refs/heads/alpha.
+remote: Review all repository rules at https://github.com/foo/bar/rules.
+remote:
+remote: - Changes must be made through a pull request.
+To https://github.com/foo/bar.git
+ ! [remote rejected] alpha -> alpha (push declined due to repository rule violations)
+error: failed to push some refs to 'https://github.com/foo/bar.git'
+";
+        // Even with exit code 0 (caused by wrapper/version quirks), the filter
+        // must NOT emit a misleading summary line when the output indicates
+        // rejection. We check for the specific summary forms rather than the
+        // bare substring "ok " because words like "hook " (in "hook declined")
+        // legitimately contain that substring.
+        let result = run_push_filter(input, 0);
+        assert!(
+            !result.contains("ok alpha\n")
+                && !result.contains("ok\n")
+                && !result.contains("ok (up-to-date)\n"),
+            "summary leaked on remote-rejected output (exit 0), got: {}",
+            result
+        );
+        // The raw rejection text must remain visible to the user.
+        assert!(result.contains("remote rejected"));
+        assert!(result.contains("GH013"));
+    }
+
+    #[test]
+    fn test_push_filter_no_summary_on_push_declined_exit0() {
+        // Variant: only the trailing "push declined" line, no explicit GH013.
+        let input = "\
+To https://github.com/foo/bar.git
+ ! [remote rejected] main -> main (push declined due to repository rule violations)
+";
+        let result = run_push_filter(input, 0);
+        assert!(
+            !result.contains("ok main\n")
+                && !result.contains("ok\n")
+                && !result.contains("ok (up-to-date)\n"),
+            "summary leaked on push-declined output (exit 0), got: {}",
+            result
+        );
+        assert!(result.contains("remote rejected"));
+    }
+
+    #[test]
+    fn test_push_filter_no_summary_on_pre_receive_hook_decline_exit0() {
+        // Variant: generic pre-receive hook decline (not GitHub-specific).
+        // Note: "hook " contains the substring "ok ", so we check for the
+        // specific summary line variants ("ok feature\n", "ok\n",
+        // "ok (up-to-date)\n") rather than the bare "ok " substring.
+        let input = "\
+To https://example.com/foo/bar.git
+ ! [remote rejected] feature -> feature (pre-receive hook declined)
+error: failed to push some refs to 'https://example.com/foo/bar.git'
+";
+        let result = run_push_filter(input, 0);
+        assert!(
+            !result.contains("ok feature\n")
+                && !result.contains("ok\n")
+                && !result.contains("ok (up-to-date)\n"),
+            "summary leaked on pre-receive-hook-declined output (exit 0), got: {}",
+            result
+        );
+        assert!(result.contains("pre-receive hook declined"));
+    }
+
+    #[test]
+    fn test_push_output_indicates_rejection_positive_cases() {
+        let cases = [
+            "To https://github.com/foo/bar.git\n ! [remote rejected] alpha -> alpha (push declined due to repository rule violations)\n",
+            "remote: error: GH013: Repository rule violations found\n",
+            " ! [rejected]        main -> main (non-fast-forward)\n",
+            " ! [remote rejected] feature -> feature (pre-receive hook declined)\n",
+            "error: failed to push some refs to 'https://github.com/foo/bar.git'\n",
+            " ! [remote rejected] main -> main (push declined due to repository rule violations)\n",
+        ];
+        for raw in cases {
+            assert!(
+                push_output_indicates_rejection(raw),
+                "expected rejection indicator in: {:?}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_output_indicates_rejection_negative_cases() {
+        let cases = [
+            "Everything up-to-date\n",
+            "To https://github.com/foo/bar.git\n   abc1234..def5678  master -> master\n",
+            "remote: Resolving deltas: 100% (2/2), completed with 2 local objects.\n",
+        ];
+        for raw in cases {
+            assert!(
+                !push_output_indicates_rejection(raw),
+                "false rejection in: {:?}",
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_filter_emits_summary_when_no_rejection_indicators() {
+        // Regression guard: regular successful push still gets its `ok <ref>` summary.
+        let input = "\
+To https://github.com/foo/bar.git
+   abc1234..def5678  master -> master
+";
+        let result = run_push_filter(input, 0);
+        assert!(
+            result.ends_with("ok master\n"),
+            "expected 'ok master' summary, got: {}",
             result
         );
     }
