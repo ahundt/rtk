@@ -212,6 +212,70 @@ pub(crate) enum ManifestResult {
     NoBlock,
 }
 
+/// Walk a `cache_path` of the form
+/// `…/cache/{vendor}/{plugin}/{version}/hooks/{file}.json` back up to its
+/// `(version_dir, plugin_dir)` pair. Returns `None` if the path has fewer
+/// than four ancestors (custom layout — callers fail open).
+fn entry_version_and_plugin_dir(entry: &ManifestEntry) -> Option<(PathBuf, PathBuf)> {
+    let cache_path = Path::new(&entry.cache_path);
+    let hooks_dir = cache_path.parent()?; // .../{version}/hooks
+    let version_dir = hooks_dir.parent()?; // .../{version}
+    let plugin_dir = version_dir.parent()?; // .../{plugin}
+    Some((version_dir.to_path_buf(), plugin_dir.to_path_buf()))
+}
+
+/// Returns `true` only if `entry` is still safe to dispatch:
+///   1. `entry.cache_path` exists on disk (plugin not uninstalled or GC'd),
+///      AND
+///   2. when the layout matches Claude Code's standard
+///      `{plugin}/{semver}/hooks/{file}.json`, `entry`'s version dir is the
+///      highest-semver sibling (so a plugin update from v1.0.0 → v2.0.0
+///      stops dispatching the old v1.0.0 handler even if its cache dir
+///      still lives on disk).
+///
+/// Fails open for custom layouts (non-semver version dir, missing
+/// ancestors, unreadable plugin dir): keeps the entry rather than risk
+/// silently dropping a legitimate handler. The on-disk `cache_path`
+/// existence check above is the floor — that always applies.
+fn is_entry_active(entry: &ManifestEntry) -> bool {
+    if !Path::new(&entry.cache_path).exists() {
+        return false;
+    }
+    let Some((entry_ver_dir, plugin_dir)) = entry_version_and_plugin_dir(entry) else {
+        return true;
+    };
+    let entry_ver_name = entry_ver_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    // Non-semver version dirs (e.g. "latest", "v1") cannot be compared
+    // safely; trust the on-disk existence check we already passed.
+    if parse_semver(entry_ver_name) == (0, 0, 0) {
+        return true;
+    }
+    let siblings = match fs::read_dir(&plugin_dir) {
+        Ok(d) => d,
+        Err(_) => return true,
+    };
+    let mut version_dirs: Vec<PathBuf> = siblings
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    if version_dirs.len() <= 1 {
+        return true;
+    }
+    version_dirs.sort_by(|a, b| {
+        let va = parse_semver(a.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        let vb = parse_semver(b.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        vb.cmp(&va) // descending
+    });
+    version_dirs
+        .first()
+        .map(|p| p == &entry_ver_dir)
+        .unwrap_or(true)
+}
+
 /// Run every handler in the manifest against the original payload.
 ///
 /// Called from BOTH:
@@ -224,6 +288,13 @@ pub(crate) enum ManifestResult {
 /// INVARIANT: `payload` MUST be the original unmodified stdin so handlers
 /// see exactly what Claude Code sent. Forwarding RTK's rewrite instead
 /// would defeat handler-level safety checks.
+///
+/// Stale-entry guard: each entry is checked by `is_entry_active` before
+/// dispatch so a plugin update (v1→v2) does not dispatch the frozen v1
+/// `fallthrough_command` whose `${CLAUDE_PLUGIN_ROOT}` was resolved to
+/// the now-superseded version directory. `rtk init` re-runs are still
+/// the canonical refresh path; this guard prevents the wrong-version
+/// dispatch in between init runs.
 ///
 /// I/O contract: never writes to stdout or stderr. Result bytes are
 /// returned for the caller to forward at the appropriate exit code.
@@ -244,6 +315,9 @@ pub(crate) fn run_manifest_handlers(payload: &str) -> ManifestResult {
     let mut block_stderr: Vec<u8> = Vec::new();
 
     for entry in &manifest.entries {
+        if !is_entry_active(entry) {
+            continue;
+        }
         let mut child = match Command::new("sh")
             .arg("-c")
             .arg(&entry.fallthrough_command)
@@ -1182,6 +1256,104 @@ mod tests {
         assert!(
             !manifest_path.exists(),
             "no PreToolUse entries → no manifest"
+        );
+    }
+
+    // ----- is_entry_active: stale-entry runtime guard --------------------
+    //
+    // Issue: BashManifest entries bake the absolute path of the active
+    // version dir into `fallthrough_command` at install time. When a
+    // plugin updates v1.0.0 → v2.5.0 between `rtk init` runs the stored
+    // command still points at v1 — dispatching it executes stale logic or
+    // crashes silently. `is_entry_active` is the runtime safety net.
+
+    fn make_entry(cache_path: &Path) -> ManifestEntry {
+        ManifestEntry {
+            cache_path: cache_path.to_string_lossy().into_owned(),
+            original_matcher: "Bash|Edit".to_string(),
+            patched_matcher: "Edit".to_string(),
+            fallthrough_command: "echo placeholder".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_is_entry_active_missing_cache_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = make_entry(&tmp.path().join("definitely/missing.json"));
+        assert!(
+            !is_entry_active(&entry),
+            "uninstalled or GC'd path must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_is_entry_active_single_version_dir_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_json = tmp
+            .path()
+            .join("plugins/cache/vendor/plug/1.0.0/hooks/h.json");
+        write_file(&hook_json, "{}");
+        let entry = make_entry(&hook_json);
+        assert!(
+            is_entry_active(&entry),
+            "single live version → entry is active"
+        );
+    }
+
+    #[test]
+    fn test_is_entry_active_old_version_when_newer_exists() {
+        // The exact scenario the user hit: plugin updated from 1.0.0 to
+        // 2.5.0, but the old cache dir survived (lazy GC). The entry's
+        // cache_path still resolves but it is no longer the active
+        // version — runtime MUST skip it so the v1 handler does not run
+        // against v2 payloads.
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("plugins/cache/vendor/plug");
+        let old_hook = plugin_dir.join("1.0.0/hooks/h.json");
+        let new_hook = plugin_dir.join("2.5.0/hooks/h.json");
+        write_file(&old_hook, "{}");
+        write_file(&new_hook, "{}");
+        let stale = make_entry(&old_hook);
+        let active = make_entry(&new_hook);
+        assert!(
+            !is_entry_active(&stale),
+            "older version dir must be skipped when a newer one exists"
+        );
+        assert!(
+            is_entry_active(&active),
+            "highest-semver version dir is the active one"
+        );
+    }
+
+    #[test]
+    fn test_is_entry_active_custom_layout_falls_open() {
+        // Custom installs that do not follow the {plugin}/{semver}/hooks
+        // layout (e.g. tests, packaged distros, symlink farms) keep their
+        // entries as long as the file exists. The path-exists check is
+        // the floor; we never silently drop an entry for layout reasons.
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_json = tmp.path().join("custom-layout/handler.json");
+        write_file(&hook_json, "{}");
+        let entry = make_entry(&hook_json);
+        assert!(
+            is_entry_active(&entry),
+            "non-semver layouts must fail open when the file exists"
+        );
+    }
+
+    #[test]
+    fn test_is_entry_active_non_semver_version_dir() {
+        // Version dir named "latest" / "v1" / etc. parses to (0,0,0). We
+        // do not try to rank these against semver siblings — fail open.
+        let tmp = tempfile::tempdir().unwrap();
+        let hook_json = tmp
+            .path()
+            .join("plugins/cache/vendor/plug/latest/hooks/h.json");
+        write_file(&hook_json, "{}");
+        let entry = make_entry(&hook_json);
+        assert!(
+            is_entry_active(&entry),
+            "non-semver version dir must fail open"
         );
     }
 }
