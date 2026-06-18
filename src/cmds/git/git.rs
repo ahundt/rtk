@@ -6,9 +6,10 @@ use crate::core::stream::{
 };
 use crate::core::tracking;
 use crate::core::truncate::CAP_WARNINGS;
-use crate::core::utils::{exit_code_from_output, exit_code_from_status, resolved_command};
+use crate::core::utils::{exit_code_from_status, resolved_command};
 use anyhow::{Context, Result};
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::process::Stdio;
 
@@ -991,18 +992,169 @@ fn build_commit_command(args: &[String], global_args: &[String]) -> Command {
 /// Handles: `[main abc1234def] message`, `[main (root-commit) abc1234def] msg`,
 /// localized variants, and multibyte branch names.
 fn parse_commit_output(line: &str) -> String {
-    if let Some(bracket_end) = line.find(']') {
-        let bracket_content = &line[1..bracket_end];
-        let hash = bracket_content.split_whitespace().next_back().unwrap_or("");
-        if !hash.is_empty() && hash.len() >= 7 {
-            let short_hash: String = hash.chars().take(7).collect();
-            format!("ok {}", short_hash)
-        } else {
-            "ok".to_string()
-        }
-    } else {
-        "ok".to_string()
+    commit_summary_from_line(line).unwrap_or_else(|| "ok".to_string())
+}
+
+fn commit_summary_from_line(line: &str) -> Option<String> {
+    if !line.starts_with('[') {
+        return None;
     }
+    let bracket_end = line.find(']')?;
+    let bracket_content = &line[1..bracket_end];
+    let hash = bracket_content.split_whitespace().next_back().unwrap_or("");
+    if hash.len() < 7 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let short_hash: String = hash.chars().take(7).collect();
+    Some(format!("ok {}", short_hash))
+}
+
+const GIT_COMMIT_CAPTURE_CAP: usize = 1_048_576;
+
+fn capture_chunk(captured: &mut Vec<u8>, chunk: &[u8]) {
+    if captured.len() >= GIT_COMMIT_CAPTURE_CAP {
+        return;
+    }
+    let take = chunk.len().min(GIT_COMMIT_CAPTURE_CAP - captured.len());
+    captured.extend_from_slice(&chunk[..take]);
+}
+
+fn stream_raw_pipe<R, W>(mut reader: R, writer: &mut W) -> std::io::Result<Vec<u8>>
+where
+    R: Read,
+    W: Write,
+{
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let count = reader.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        let chunk = &buf[..count];
+        capture_chunk(&mut captured, chunk);
+        writer.write_all(chunk)?;
+        writer.flush()?;
+    }
+
+    Ok(captured)
+}
+
+fn stream_commit_stdout<R, W>(mut reader: R, writer: &mut W) -> std::io::Result<Vec<u8>>
+where
+    R: Read,
+    W: Write,
+{
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut pending_summary_line = Vec::new();
+    let mut at_line_start = true;
+
+    loop {
+        let count = reader.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        for &byte in &buf[..count] {
+            capture_chunk(&mut captured, std::slice::from_ref(&byte));
+
+            if !pending_summary_line.is_empty() || (at_line_start && byte == b'[') {
+                pending_summary_line.push(byte);
+                if byte == b'\n' {
+                    let line = String::from_utf8_lossy(&pending_summary_line);
+                    if commit_summary_from_line(line.trim_end_matches(['\r', '\n'])).is_none() {
+                        writer.write_all(&pending_summary_line)?;
+                        writer.flush()?;
+                    }
+                    pending_summary_line.clear();
+                    at_line_start = true;
+                } else if pending_summary_line.len() > 8192 {
+                    writer.write_all(&pending_summary_line)?;
+                    writer.flush()?;
+                    pending_summary_line.clear();
+                    at_line_start = false;
+                }
+            } else {
+                writer.write_all(std::slice::from_ref(&byte))?;
+                writer.flush()?;
+                at_line_start = byte == b'\n';
+            }
+        }
+    }
+
+    if !pending_summary_line.is_empty() {
+        let line = String::from_utf8_lossy(&pending_summary_line);
+        if commit_summary_from_line(&line).is_none() {
+            writer.write_all(&pending_summary_line)?;
+            writer.flush()?;
+        }
+    }
+
+    Ok(captured)
+}
+
+fn compact_commit_summary(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find(|line| commit_summary_from_line(line).is_some())
+        .map(parse_commit_output)
+        .unwrap_or_else(|| "ok".to_string())
+}
+
+fn stream_commit_command(cmd: &mut Command) -> Result<(i32, String, String)> {
+    cmd.stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut child = ChildGuard(Some(cmd.spawn().context("Failed to run git commit")?));
+    let inner = child.0.as_mut().context("git commit process missing")?;
+    let stdout_pipe = inner
+        .stdout
+        .take()
+        .context("Failed to capture git commit stdout")?;
+    let stderr_pipe = inner
+        .stderr
+        .take()
+        .context("Failed to capture git commit stderr")?;
+
+    let stdout_handle = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut out = std::io::stdout().lock();
+        stream_commit_stdout(stdout_pipe, &mut out)
+    });
+    let stderr_handle = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut err = std::io::stderr().lock();
+        stream_raw_pipe(stderr_pipe, &mut err)
+    });
+
+    let status = child
+        .0
+        .take()
+        .context("git commit process missing")?
+        .wait()
+        .context("Failed waiting for git commit")?;
+    let stdout_bytes = stdout_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("git commit stdout streaming thread panicked"))??;
+    let stderr_bytes = stderr_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("git commit stderr streaming thread panicked"))??;
+
+    Ok((
+        exit_code_from_status(&status, "git commit"),
+        String::from_utf8_lossy(&stdout_bytes).into_owned(),
+        String::from_utf8_lossy(&stderr_bytes).into_owned(),
+    ))
 }
 
 fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i32> {
@@ -1014,26 +1166,14 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
         eprintln!("{}", original_cmd);
     }
 
-    let output = build_commit_command(args, global_args)
-        .stdin(Stdio::inherit())
-        .output()
-        .context("Failed to run git commit")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let exit_code = exit_code_from_output(&output, "git commit");
+    let (exit_code, stdout, stderr) = stream_commit_command(&mut build_commit_command(
+        args,
+        global_args,
+    ))?;
     let raw_output = format!("{}\n{}", stdout, stderr);
 
-    if output.status.success() {
-        // Extract commit hash from output like "[main abc1234] message"
-        // or "[main (root-commit) abc1234] message" (incl. localized variants)
-        // The hash is always the last whitespace-separated token before ']'.
-        let compact = if let Some(line) = stdout.lines().next() {
-            parse_commit_output(line)
-        } else {
-            "ok".to_string()
-        };
-
+    if exit_code == 0 {
+        let compact = compact_commit_summary(&stdout);
         println!("{}", compact);
 
         timer.track(&original_cmd, "rtk git commit", &raw_output, &compact);
@@ -1046,12 +1186,6 @@ fn run_commit(args: &[String], verbose: u8, global_args: &[String]) -> Result<i3
             "ok (nothing to commit)",
         );
     } else {
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
-        }
-        if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
-        }
         timer.track(&original_cmd, "rtk git commit", &raw_output, &raw_output);
         return Ok(exit_code);
     }
@@ -2427,6 +2561,57 @@ no changes added to commit (use "git add" and/or "git commit -a")
     #[test]
     fn test_parse_commit_output_empty() {
         assert_eq!(parse_commit_output(""), "ok");
+    }
+
+    #[test]
+    fn test_commit_summary_from_line_requires_hex_hash() {
+        assert_eq!(
+            commit_summary_from_line("[main abc1234def] add feature").as_deref(),
+            Some("ok abc1234")
+        );
+        assert!(commit_summary_from_line("[main not-a-hash] hook output").is_none());
+        assert!(commit_summary_from_line("pre-commit stdout").is_none());
+    }
+
+    fn stream_commit_stdout_for_test(input: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut output = Vec::new();
+        let captured = stream_commit_stdout(input, &mut output).unwrap();
+        (captured, output)
+    }
+
+    #[test]
+    fn test_stream_commit_stdout_suppresses_git_success_line() {
+        for (case, input, expected) in [
+            (
+                "summary line between hook output",
+                b"pre-commit stdout\n[main abc1234def] add feature\npost-commit stdout\n"
+                    .as_slice(),
+                b"pre-commit stdout\npost-commit stdout\n".as_slice(),
+            ),
+            (
+                "summary line without trailing newline",
+                b"[main abc1234def] add feature".as_slice(),
+                b"".as_slice(),
+            ),
+        ] {
+            let (captured, output) = stream_commit_stdout_for_test(input);
+
+            assert_eq!(captured, input);
+            assert_eq!(output, expected, "{case}: streamed output changed");
+        }
+    }
+
+    #[test]
+    fn test_stream_commit_stdout_preserves_non_summary_output() {
+        for input in [
+            b"[hook not-a-hash] still visible\n".as_slice(),
+            b"[feature] hook output without hash\n".as_slice(),
+            b"pre-commit prompt: ".as_slice(),
+        ] {
+            let (captured, output) = stream_commit_stdout_for_test(input);
+            assert_eq!(captured, input, "capture changed for {input:?}");
+            assert_eq!(output, input, "streamed output changed for {input:?}");
+        }
     }
 
     /// Regression test: --oneline and other user format flags must preserve all commits.
