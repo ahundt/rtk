@@ -1588,8 +1588,7 @@ fn run_cli() -> Result<i32> {
     };
 
     // Warn if installed hook is outdated/missing (1/day, non-blocking).
-    // Skip for Gain — it shows its own inline hook warning.
-    if !matches!(cli.command, Commands::Gain { .. }) {
+    if should_warn_about_hook_install(&cli.command) {
         hooks::hook_check::maybe_warn();
     }
 
@@ -2701,6 +2700,15 @@ fn run_cli() -> Result<i32> {
     Ok(code)
 }
 
+fn should_warn_about_hook_install(command: &Commands) -> bool {
+    !matches!(
+        command,
+        // `gain` prints its own inline hook warning. Hook protocol commands and
+        // `rewrite` must keep stderr clean because host integrations parse them.
+        Commands::Gain { .. } | Commands::Hook { .. } | Commands::Rewrite { .. }
+    )
+}
+
 /// Returns true for commands that are invoked via the hook pipeline
 /// (i.e., commands that process rewritten shell commands).
 /// Meta commands (init, gain, verify, etc.) are excluded because
@@ -3576,6 +3584,27 @@ mod tests {
             }
             _ => panic!("Expected Commands::Npx for unknown tool"),
         }
+    }
+
+    #[test]
+    fn test_hook_protocol_commands_skip_hook_install_warning() {
+        fn warns(args: &[&str]) -> bool {
+            let cli = Cli::try_parse_from(args).unwrap();
+            should_warn_about_hook_install(&cli.command)
+        }
+
+        for args in [
+            &["rtk", "hook", "claude"][..],
+            &["rtk", "rewrite", "git status"],
+            &["rtk", "gain"],
+        ] {
+            assert!(!warns(args), "{args:?} must keep stderr clean");
+        }
+
+        assert!(
+            warns(&["rtk", "git", "status"]),
+            "normal user commands should keep the install warning"
+        );
     }
 
     #[test]
