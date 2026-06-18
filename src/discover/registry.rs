@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{split_on_operators, tokenize, ParsedToken, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -462,8 +462,9 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
-/// For pipes (`|`), only rewrites the left-hand command (pipe targets stay raw),
-/// but continues rewriting segments after subsequent `&&`/`||`/`;` operators.
+/// For pipes (`|`), leaves the left-hand command raw unless the pipe tail is made
+/// only of display sinks such as `head`, `tail`, or `tee`, then continues rewriting
+/// segments after subsequent `&&`/`||`/`;` operators.
 /// Also strips user-configured transparent wrapper prefixes
 /// (`[hooks].transparent_prefixes` in `config.toml`) before routing.
 ///
@@ -557,17 +558,26 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe => {
-                // Issue #1560: pipe consumers must see raw upstream output;
-                // resume rewriting only after the next command operator.
+                // Issue #1560: semantic consumers need raw input; display sinks
+                // can preserve useful rewrites such as `cargo test | tail -50`.
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = seg.to_string();
-                result.push_str(&rewritten);
-
                 let pipe_group_end = tokens.iter().find(|t| {
                     t.offset > tok.offset
                         && (t.kind == TokenKind::Operator
                             || (t.kind == TokenKind::Shellism && t.value == "&"))
                 });
+                let pipe_group_end_offset = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
+                let pipe_tail = cmd[tok.offset..pipe_group_end_offset].trim();
+                let rewritten = if is_display_sink_pipe_tail(pipe_tail) {
+                    rewrite_segment(seg, excluded, transparent_prefixes)
+                        .unwrap_or_else(|| seg.to_string())
+                } else {
+                    seg.to_string()
+                };
+                if rewritten != seg {
+                    any_changed = true;
+                }
+                result.push_str(&rewritten);
 
                 match pipe_group_end {
                     Some(next_op) => {
@@ -613,6 +623,84 @@ fn rewrite_compound(
     } else {
         None
     }
+}
+
+fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
+    let tokens = tokenize(pipe_tail);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let mut idx = 0;
+    let mut saw_stage = false;
+    while idx < tokens.len() {
+        if tokens[idx].kind != TokenKind::Pipe {
+            return false;
+        }
+        idx += 1;
+
+        if idx >= tokens.len() || tokens[idx].kind != TokenKind::Arg {
+            return false;
+        }
+        let cmd = strip_absolute_path(&tokens[idx].value);
+        idx += 1;
+
+        let args_start = idx;
+        while idx < tokens.len() && tokens[idx].kind != TokenKind::Pipe {
+            if tokens[idx].kind != TokenKind::Arg {
+                return false;
+            }
+            idx += 1;
+        }
+
+        if !is_display_sink_stage(&cmd, &tokens[args_start..idx]) {
+            return false;
+        }
+        saw_stage = true;
+    }
+
+    saw_stage
+}
+
+fn is_display_sink_stage(cmd: &str, args: &[ParsedToken]) -> bool {
+    match cmd {
+        "head" | "tail" => is_head_tail_stdin_args(args),
+        "tee" => true,
+        "cat" => args.is_empty(),
+        _ => false,
+    }
+}
+
+fn is_head_tail_stdin_args(args: &[ParsedToken]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].value.as_str() {
+            "-n" | "--lines" => {
+                idx += 1;
+                if idx >= args.len() || !is_positive_decimal(&args[idx].value) {
+                    return false;
+                }
+            }
+            value if is_short_line_count(value) || is_long_line_count(value) => {}
+            _ => return false,
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn is_short_line_count(value: &str) -> bool {
+    value.strip_prefix('-').is_some_and(is_positive_decimal)
+}
+
+fn is_long_line_count(value: &str) -> bool {
+    value
+        .strip_prefix("--lines=")
+        .is_some_and(is_positive_decimal)
+}
+
+fn is_positive_decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn rewrite_line_range(cmd: &str) -> Option<String> {
@@ -1496,18 +1584,45 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_lhs_stays_raw_for_common_consumers() {
+    fn test_pipe_lhs_stays_raw_for_semantic_consumers() {
         // Issue #1560: RTK summaries/compression can silently change the bytes
         // seen by downstream tools such as grep and head.
+        // grep/head-with-file/cat-flags inspect output semantics, so the pipe
+        // input must stay raw even though display-only sinks can rewrite.
         for cmd in [
             "ps aux | grep python | grep -v grep",
             "git log -10 | grep feat",
-            "cargo test | head -5",
+            "cargo test | head -5 src/lib.rs",
+            "cargo test | cat -n",
         ] {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
                 None,
-                "{cmd} should keep the pipe input raw"
+                "{cmd} should keep semantic pipe input raw"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipe_lhs_rewrites_for_display_sinks() {
+        // Display sinks do not semantically filter the stream, so recovering
+        // RTK on the left-hand command keeps useful token savings.
+        for (cmd, rewritten) in [
+            ("cargo test | head -5", "rtk cargo test | head -5"),
+            (
+                "cargo test 2>&1 | tail -50",
+                "rtk cargo test 2>&1 | tail -50",
+            ),
+            (
+                "cargo test | tee /tmp/rtk-test.log",
+                "rtk cargo test | tee /tmp/rtk-test.log",
+            ),
+            ("cargo test | cat", "rtk cargo test | cat"),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd} should rewrite before display-only pipe sinks"
             );
         }
     }
@@ -1685,10 +1800,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
-        // #1560: LHS of pipe stays raw, including its redirect.
+        // A display sink can preserve the rewrite and the redirect suffix.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | head", &[]),
-            None
+            Some("rtk cargo test 2>&1 | head".into())
         );
     }
 
@@ -4056,11 +4171,11 @@ mod tests {
         for (cmd, rewritten) in [
             (
                 "git log | head -5 && git stash",
-                "git log | head -5 && rtk git stash",
+                "rtk git log | head -5 && rtk git stash",
             ),
             (
                 "cargo test | head; git status",
-                "cargo test | head; rtk git status",
+                "rtk cargo test | head; rtk git status",
             ),
             (
                 "cargo test | grep FAIL || git stash",
@@ -4076,13 +4191,13 @@ mod tests {
             ),
             (
                 "git log | head | tail && git status",
-                "git log | head | tail && rtk git status",
+                "rtk git log | head | tail && rtk git status",
             ),
         ] {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
                 Some(rewritten.into()),
-                "{cmd} should keep the pipe group raw and rewrite later simple commands"
+                "{cmd} should preserve pipe semantics and rewrite later simple commands"
             );
         }
     }
