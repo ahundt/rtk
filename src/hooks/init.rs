@@ -5506,23 +5506,43 @@ mod tests {
     // patch_plugin_caches; the v3 adaptation applies the same idea to
     // settings.json hook entries that reference different rtk binary paths.
 
+    fn settings_with_pre_tool_use_command(command: &str) -> serde_json::Value {
+        serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{
+                        "type": "command",
+                        "command": command
+                    }]
+                }]
+            }
+        })
+    }
+
+    fn pre_tool_use_len(root: &serde_json::Value) -> usize {
+        root["hooks"]["PreToolUse"].as_array().unwrap().len()
+    }
+
+    fn hook_commands(root: &serde_json::Value) -> Vec<&str> {
+        root["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(|hook| hook.get("command")?.as_str())
+            .collect()
+    }
+
     /// settings.json contains a hook entry for an older rtk binary path
     /// (`/opt/rtk-0.31.0/bin/rtk hook claude`). When we insert a hook for a
     /// newer rtk version (matching CARGO_PKG_VERSION at build time), the older
     /// entry must be removed so only one rtk hook fires per command.
     #[test]
     fn test_dedup_removes_older_rtk_version() {
-        let mut json_content = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [{
-                        "type": "command",
-                        "command": "/opt/rtk-0.31.0/bin/rtk hook claude"
-                    }]
-                }]
-            }
-        });
+        let mut json_content =
+            settings_with_pre_tool_use_command("/opt/rtk-0.31.0/bin/rtk hook claude");
 
         // hook_already_present must report false because the existing entry is
         // for a strictly older rtk version (0.31.0 < current). This lets the
@@ -5534,14 +5554,7 @@ mod tests {
 
         insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
 
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        let commands: Vec<&str> = pre_tool_use
-            .iter()
-            .filter_map(|e| e.get("hooks")?.as_array())
-            .flatten()
-            .filter_map(|h| h.get("command")?.as_str())
-            .collect();
-
+        let commands = hook_commands(&json_content);
         assert!(
             !commands.iter().any(|c| c.contains("rtk-0.31.0")),
             "older rtk-0.31.0 entry should be removed; got: {commands:?}"
@@ -5558,23 +5571,10 @@ mod tests {
     /// caller short-circuits.
     #[test]
     fn test_dedup_preserves_same_version() {
-        let mut json_content = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [{
-                        "type": "command",
-                        "command": CLAUDE_HOOK_COMMAND
-                    }]
-                }]
-            }
-        });
+        let mut json_content = settings_with_pre_tool_use_command(CLAUDE_HOOK_COMMAND);
 
         // Snapshot the entry count before any operation.
-        let before_len = json_content["hooks"]["PreToolUse"]
-            .as_array()
-            .unwrap()
-            .len();
+        let before_len = pre_tool_use_len(&json_content);
 
         assert!(
             hook_already_present(&json_content, CLAUDE_HOOK_COMMAND),
@@ -5585,20 +5585,17 @@ mod tests {
         // remove the existing same-version entry (no false dedup).
         insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
 
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        let same_version_count = pre_tool_use
+        let commands = hook_commands(&json_content);
+        let same_version_count = commands
             .iter()
-            .filter_map(|e| e.get("hooks")?.as_array())
-            .flatten()
-            .filter_map(|h| h.get("command")?.as_str())
-            .filter(|c| *c == CLAUDE_HOOK_COMMAND)
+            .filter(|command| **command == CLAUDE_HOOK_COMMAND)
             .count();
         assert!(
             same_version_count >= 1,
             "same-version entry must be preserved (not removed by dedup)"
         );
         assert!(
-            pre_tool_use.len() >= before_len,
+            pre_tool_use_len(&json_content) >= before_len,
             "no entries should be silently dropped"
         );
     }
@@ -5612,17 +5609,7 @@ mod tests {
         // Construct a path with a version definitively newer than CARGO_PKG_VERSION.
         // u32::MAX in the major position is unambiguously greater than any real release.
         let newer_path = "/opt/rtk-9999.0.0/bin/rtk hook claude";
-        let json_content = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "matcher": "Bash",
-                    "hooks": [{
-                        "type": "command",
-                        "command": newer_path
-                    }]
-                }]
-            }
-        });
+        let json_content = settings_with_pre_tool_use_command(newer_path);
 
         assert!(
             hook_already_present(&json_content, CLAUDE_HOOK_COMMAND),
@@ -5631,13 +5618,7 @@ mod tests {
 
         // The caller short-circuits on hook_already_present == true, so the
         // settings.json must be left unchanged.
-        let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
-        let commands: Vec<&str> = pre_tool_use
-            .iter()
-            .filter_map(|e| e.get("hooks")?.as_array())
-            .flatten()
-            .filter_map(|h| h.get("command")?.as_str())
-            .collect();
+        let commands = hook_commands(&json_content);
         assert!(
             commands.iter().any(|c| c.contains("rtk-9999.0.0")),
             "newer-version entry must be preserved untouched; got: {commands:?}"
