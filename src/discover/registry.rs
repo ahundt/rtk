@@ -3,7 +3,9 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{
+    contains_compound_boundary, split_on_operators, tokenize, ParsedToken, TokenKind,
+};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -462,8 +464,10 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
-/// For pipes (`|`), only rewrites the left-hand command (pipe targets stay raw),
-/// but continues rewriting segments after subsequent `&&`/`||`/`;` operators.
+/// For pipes (`|`), leaves the left-hand command raw for content-sensitive
+/// consumers. It rewrites the producer only when every remaining pipe stage is
+/// known to accept RTK-filtered output, then continues rewriting segments after
+/// subsequent `&&`/`||`/`;` operators.
 /// Also strips user-configured transparent wrapper prefixes
 /// (`[hooks].transparent_prefixes` in `config.toml`) before routing.
 ///
@@ -504,12 +508,7 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    let has_compound = trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains('|')
-        || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !contains_compound_boundary(trimmed) && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
         return Some(trimmed.to_string());
     }
 
@@ -557,27 +556,27 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe => {
+                // Issue #1560: content-sensitive consumers need raw stdout.
+                // Recover rewrites only for pipe tails that accept RTK-filtered
+                // output, such as `cargo test | tail -50`.
                 let seg = cmd[seg_start..tok.offset].trim();
-                let is_pipe_incompatible = seg.starts_with("find ")
-                    || seg == "find"
-                    || seg.starts_with("fd ")
-                    || seg == "fd";
-                let rewritten = if is_pipe_incompatible {
-                    seg.to_string()
-                } else {
-                    rewrite_segment(seg, excluded, transparent_prefixes)
-                        .unwrap_or_else(|| seg.to_string())
-                };
-                if rewritten != seg {
-                    any_changed = true;
-                }
-                result.push_str(&rewritten);
-
                 let pipe_group_end = tokens.iter().find(|t| {
                     t.offset > tok.offset
                         && (t.kind == TokenKind::Operator
                             || (t.kind == TokenKind::Shellism && t.value == "&"))
                 });
+                let pipe_group_end_offset = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
+                let pipe_tail = cmd[tok.offset..pipe_group_end_offset].trim();
+                let rewritten = if pipe_tail_accepts_filtered_output(pipe_tail) {
+                    rewrite_segment(seg, excluded, transparent_prefixes)
+                        .unwrap_or_else(|| seg.to_string())
+                } else {
+                    seg.to_string()
+                };
+                if rewritten != seg {
+                    any_changed = true;
+                }
+                result.push_str(&rewritten);
 
                 match pipe_group_end {
                     Some(next_op) => {
@@ -623,6 +622,82 @@ fn rewrite_compound(
     } else {
         None
     }
+}
+
+fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
+    let tokens = tokenize(pipe_tail);
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let mut idx = 0;
+    let mut saw_stage = false;
+    while idx < tokens.len() {
+        if tokens[idx].kind != TokenKind::Pipe {
+            return false;
+        }
+        idx += 1;
+
+        if idx >= tokens.len() || tokens[idx].kind != TokenKind::Arg {
+            return false;
+        }
+        let cmd = strip_absolute_path(&tokens[idx].value);
+        idx += 1;
+
+        let args_start = idx;
+        while idx < tokens.len() && tokens[idx].kind != TokenKind::Pipe {
+            if tokens[idx].kind != TokenKind::Arg {
+                return false;
+            }
+            idx += 1;
+        }
+
+        if !pipe_stage_accepts_filtered_output(&cmd, &tokens[args_start..idx]) {
+            return false;
+        }
+        saw_stage = true;
+    }
+
+    saw_stage
+}
+
+fn pipe_stage_accepts_filtered_output(cmd: &str, args: &[ParsedToken]) -> bool {
+    match cmd {
+        "head" | "tail" => head_tail_reads_stdin_only(args),
+        "tee" => true,
+        "cat" => args.is_empty(),
+        _ => false,
+    }
+}
+
+fn head_tail_reads_stdin_only(args: &[ParsedToken]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].value.as_str() {
+            "-n" | "--lines" => {
+                idx += 1;
+                if idx >= args.len() || !is_decimal_count(&args[idx].value) {
+                    return false;
+                }
+            }
+            value if is_short_line_count(value) || is_long_line_count(value) => {}
+            _ => return false,
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn is_short_line_count(value: &str) -> bool {
+    value.strip_prefix('-').is_some_and(is_decimal_count)
+}
+
+fn is_long_line_count(value: &str) -> bool {
+    value.strip_prefix("--lines=").is_some_and(is_decimal_count)
+}
+
+fn is_decimal_count(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn rewrite_line_range(cmd: &str) -> Option<String> {
@@ -1488,11 +1563,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_pipe_first_only() {
-        // After a pipe, the filter command stays raw
+    fn test_rewrite_pipe_content_sensitive_consumer_skipped() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -1504,6 +1578,54 @@ mod tests {
             rewrite_command_no_prefixes("find . -name '*.rs' | xargs grep 'fn run'", &[]),
             None
         );
+    }
+
+    #[test]
+    fn test_pipe_lhs_stays_raw_for_semantic_consumers() {
+        // Issue #1560: RTK summaries/compression can silently change the bytes
+        // seen by downstream tools such as grep and head-with-file.
+        // grep/head-with-file/cat-flags inspect output semantics, so the pipe
+        // input must stay raw even though display-bounding tails can rewrite.
+        for cmd in [
+            "ps aux | grep python | grep -v grep",
+            "git log -10 | grep feat",
+            "cargo test | head -5 src/lib.rs",
+            "cargo test | cat -n",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                None,
+                "{cmd} should keep semantic pipe input raw"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipe_lhs_rewrites_when_tail_accepts_filtered_output() {
+        // These pipe tails are used to bound or copy display output, so the
+        // producer can still use RTK's filtered output.
+        for (cmd, rewritten) in [
+            ("cargo test | head -5", "rtk cargo test | head -5"),
+            (
+                "cargo test | /usr/bin/head -5",
+                "rtk cargo test | /usr/bin/head -5",
+            ),
+            (
+                "cargo test 2>&1 | tail -50",
+                "rtk cargo test 2>&1 | tail -50",
+            ),
+            (
+                "cargo test | tee /tmp/rtk-test.log",
+                "rtk cargo test | tee /tmp/rtk-test.log",
+            ),
+            ("cargo test | cat", "rtk cargo test | cat"),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd} should rewrite before pipe tails that accept filtered output"
+            );
+        }
     }
 
     #[test]
@@ -1679,6 +1801,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
+        // This pipe tail accepts RTK-filtered output, so the redirect suffix is
+        // still preserved when the producer is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | head", &[]),
             Some("rtk cargo test 2>&1 | head".into())
@@ -3302,18 +3426,19 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // Pipe: rewrite first segment only, pass through rest unchanged
+        // #1560: LHS of pipe stays raw — `rtk cargo test` would compress output.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("rtk cargo test | grep FAILED".into())
+            None
         );
     }
 
     #[test]
     fn test_rewrite_compound_pipe_git_grep() {
+        // #1560: LHS of pipe stays raw — `rtk git log` would compress output.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -4042,56 +4167,42 @@ mod tests {
     }
 
     // --- Pipe + operator rewrite ---
-
     #[test]
-    fn test_rewrite_pipe_then_and() {
-        assert_eq!(
-            rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("rtk git log | head -5 && rtk git stash".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_pipe_then_semicolon() {
-        assert_eq!(
-            rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("rtk cargo test | head; rtk git status".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_pipe_then_or() {
-        assert_eq!(
-            rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("rtk cargo test | grep FAIL || rtk git stash".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_env_pipe_then_and() {
-        assert_eq!(
-            rewrite_command_no_prefixes(
-                "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
-                &[]
+    fn test_rewrite_resumes_after_pipe_group_operator() {
+        // Apply the pipe-tail policy to the pipe group, then resume rewriting
+        // independent commands after &&, ||, or ;.
+        for (cmd, rewritten) in [
+            (
+                "git log | head -5 && git stash",
+                "rtk git log | head -5 && rtk git stash",
             ),
-            Some("RUST_BACKTRACE=1 rtk cargo test 2>&1 | grep FAILED && rtk git stash".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_and_then_pipe() {
-        assert_eq!(
-            rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && rtk cargo test | grep FAIL".into())
-        );
-    }
-
-    #[test]
-    fn test_rewrite_multi_pipe_then_and() {
-        assert_eq!(
-            rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("rtk git log | head | tail && rtk git status".into())
-        );
+            (
+                "cargo test | head; git status",
+                "rtk cargo test | head; rtk git status",
+            ),
+            (
+                "cargo test | grep FAIL || git stash",
+                "cargo test | grep FAIL || rtk git stash",
+            ),
+            (
+                "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
+                "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && rtk git stash",
+            ),
+            (
+                "git status && cargo test | grep FAIL",
+                "rtk git status && cargo test | grep FAIL",
+            ),
+            (
+                "git log | head | tail && git status",
+                "rtk git log | head | tail && rtk git status",
+            ),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(rewritten.into()),
+                "{cmd} should preserve pipe semantics and rewrite later simple commands"
+            );
+        }
     }
 
     // --- line-continuation handling (issue #1564) -------------------
@@ -4155,6 +4266,34 @@ mod tests {
         assert_eq!(
             collapse_line_continuations("git diff HEAD~1"),
             std::borrow::Cow::<str>::Borrowed("git diff HEAD~1"),
+        );
+    }
+
+    #[test]
+    fn test_already_rtk_fastpath_uses_lexer_boundaries() {
+        // PR #536 / issue #361 edge case: quoted operators and fd redirects
+        // are still simple commands, so the already-rtk fast path must use the
+        // lexer rather than raw substring checks.
+        for cmd in [
+            r#"rtk git commit -m "Fix && Bug""#,
+            r#"rtk git commit -m "a || b""#,
+            r#"rtk git commit -m "end; here""#,
+            r#"rtk git commit -m "left | right""#,
+            r#"rtk git commit -m "x & y""#,
+            r#"rtk git commit -m 'Fix && Bug'"#,
+            "rtk cargo test 2>&1",
+            "rtk cargo test &>/dev/null",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(cmd.to_string()),
+                "{cmd:?} should use the already-rtk fast path"
+            );
+        }
+
+        assert_eq!(
+            rewrite_command_no_prefixes("rtk git status && cargo test", &[]),
+            Some("rtk git status && rtk cargo test".to_string())
         );
     }
 }
