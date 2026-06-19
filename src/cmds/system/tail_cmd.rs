@@ -111,58 +111,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compact_tail_strips_ansi() {
-        // ANSI-coloured log lines (the common case for `tail journalctl`-style output).
-        let input = "\x1b[32mINFO\x1b[0m starting\n\x1b[31mERROR\x1b[0m failed\n";
-        let output = compact_tail(input);
-        assert!(!output.contains('\x1b'), "ANSI escape leaked: {output:?}");
-        assert!(output.contains("INFO starting"));
-        assert!(output.contains("ERROR failed"));
+    fn compact_tail_formats_small_outputs_exactly() {
+        let ten_line_input = (1..=10)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ten_line_expected = (1..=10)
+            .map(|n| format!("{n:>2}  line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cases = [
+            ("empty input", "", String::new()),
+            (
+                "single-digit line numbers",
+                "alpha\nbravo\ncharlie",
+                "1  alpha\n2  bravo\n3  charlie".to_string(),
+            ),
+            (
+                "trailing newline preserved for downstream pipes",
+                "only line\n",
+                "1  only line\n".to_string(),
+            ),
+            (
+                "ANSI-coloured log lines are stripped",
+                "\x1b[32mINFO\x1b[0m starting\n\x1b[31mERROR\x1b[0m failed\n",
+                "1  INFO starting\n2  ERROR failed\n".to_string(),
+            ),
+            ("two-digit line-number padding", &ten_line_input, ten_line_expected),
+        ];
+
+        for (name, input, expected) in cases {
+            assert_eq!(compact_tail(input), expected, "{name}");
+        }
     }
 
     #[test]
-    fn test_compact_tail_adds_line_numbers() {
-        let input = "alpha\nbravo\ncharlie";
-        let output = compact_tail(input);
-        // Single-digit indices with no left-pad since max width = 1
-        assert!(output.contains("1  alpha"), "missing '1  alpha' in {output:?}");
-        assert!(output.contains("2  bravo"));
-        assert!(output.contains("3  charlie"));
-    }
-
-    #[test]
-    fn test_compact_tail_collapses_long_output() {
-        // 300 lines > COLLAPSE_THRESHOLD (200) → middle is replaced by a summary marker.
+    fn compact_tail_collapses_long_output_with_context() {
+        // 300 lines > COLLAPSE_THRESHOLD (200): keep edges and summarize the middle.
         let lines: Vec<String> = (1..=300).map(|n| format!("line {n}")).collect();
         let input = lines.join("\n");
         let output = compact_tail(&input);
+        let numbered_lines: Vec<&str> = output.lines().collect();
 
-        // Summary marker present
+        assert_eq!(
+            numbered_lines.len(),
+            KEEP_EDGE_LINES * 2 + 1,
+            "collapsed output should keep head/tail context plus one marker:\n{output}"
+        );
         assert!(
             output.contains("... 200 lines skipped ..."),
             "expected skipped-lines marker, got:\n{output}"
         );
-        // First and last edge lines survive
-        assert!(output.contains("line 1"), "head missing");
-        assert!(output.contains("line 300"), "tail missing");
-        // A line firmly in the elided middle is gone
+        assert!(numbered_lines[0].ends_with("line 1"), "head missing");
+        assert!(numbered_lines[49].ends_with("line 50"), "head edge missing");
+        assert!(
+            numbered_lines[51].ends_with("line 251"),
+            "tail edge missing"
+        );
+        assert!(numbered_lines[100].ends_with("line 300"), "tail missing");
         assert!(
             !output.contains("line 150"),
             "middle should be collapsed, got:\n{output}"
         );
-    }
-
-    #[test]
-    fn test_compact_tail_empty_input() {
-        assert_eq!(compact_tail(""), "");
-    }
-
-    #[test]
-    fn test_compact_tail_preserves_trailing_newline() {
-        // `tail` output normally ends with `\n`; downstream pipes care about that.
-        let input = "only line\n";
-        let output = compact_tail(input);
-        assert!(output.ends_with('\n'), "trailing newline lost: {output:?}");
-        assert!(output.contains("1  only line"));
     }
 }
