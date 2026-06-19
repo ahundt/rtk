@@ -69,65 +69,78 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
-    fn tmp(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("rtk_trash_test_{name}"));
-        fs::write(&p, "x").unwrap();
-        p
-    }
-
-    fn rm(p: &PathBuf) {
-        let _ = fs::remove_file(p);
-    }
-
-    #[test]
-    fn t_empty() {
-        assert!(!execute(&[]).unwrap());
-    }
-
-    #[test]
-    fn t_missing() {
-        assert!(!execute(&["/nope_rtk_trash_test".into()]).unwrap());
+    fn fixture_files(names: &[&str]) -> (TempDir, Vec<PathBuf>) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let paths = names
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                fs::write(&path, "x").expect("write trash test fixture");
+                path
+            })
+            .collect();
+        (dir, paths)
     }
 
     #[test]
-    fn t_single() {
-        let p = tmp("s");
-        assert!(execute(&[p.to_string_lossy().into()]).unwrap());
-        rm(&p); // best-effort cleanup if trash failed
+    fn execute_rejects_empty_or_missing_inputs() {
+        let cases = [
+            ("no paths", vec![]),
+            ("empty strings only", vec!["".to_string()]),
+            ("missing path", vec!["/nope_rtk_trash_test".to_string()]),
+        ];
+
+        for (name, paths) in cases {
+            assert!(!execute(&paths).unwrap(), "{name}");
+        }
     }
 
     #[test]
-    fn t_multi() {
-        let (a, b) = (tmp("a"), tmp("b"));
-        assert!(execute(&[a.to_string_lossy().into(), b.to_string_lossy().into()]).unwrap());
-        rm(&a);
-        rm(&b);
+    fn execute_trashes_existing_paths() {
+        let (_dir, paths) = fixture_files(&["one.txt", "two.txt"]);
+        let args: Vec<String> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(execute(&args).unwrap());
+        assert!(paths.iter().all(|path| !path.exists()), "{paths:?}");
     }
 
     #[test]
-    fn t_partial_missing_returns_false() {
-        let p = tmp("partial");
+    fn execute_reports_partial_missing_paths_as_failure() {
+        let (_dir, paths) = fixture_files(&["partial.txt"]);
         assert!(
-            !execute(&[p.to_string_lossy().into(), "/nope_rtk_trash_test_partial".into()])
-                .unwrap()
+            !execute(&[
+                paths[0].to_string_lossy().into_owned(),
+                "/nope_rtk_trash_test_partial".to_string()
+            ])
+            .unwrap(),
+            "partial success must keep rm-style non-zero semantics"
         );
-        rm(&p);
     }
 
     #[test]
-    fn t_expand_tilde_simple() {
+    fn run_maps_boolean_result_to_exit_code() {
+        let (_dir, paths) = fixture_files(&["exit-code.txt"]);
+        assert_eq!(run(&[]).unwrap(), 1);
+        assert_eq!(run(&[paths[0].to_string_lossy().into_owned()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn expand_tilde_handles_only_current_user_home() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
-        assert_eq!(expand_tilde("~/src"), format!("{home}/src"));
-    }
+        let cases = [
+            ("~", home.clone()),
+            ("~/src", format!("{home}/src")),
+            ("/absolute/path", "/absolute/path".to_string()),
+            ("~other/path", "~other/path".to_string()),
+        ];
 
-    #[test]
-    fn t_expand_tilde_no_tilde() {
-        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
-    }
-
-    #[test]
-    fn t_expand_tilde_user_literal() {
-        assert_eq!(expand_tilde("~other/path"), "~other/path");
+        for (input, expected) in cases {
+            assert_eq!(expand_tilde(input), expected, "{input}");
+        }
     }
 }
