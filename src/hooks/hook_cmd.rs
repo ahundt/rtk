@@ -1742,8 +1742,9 @@ mod tests {
 
     // ── Gemini robustness tests ─────────────────────────────────────────
     //
-    // These tests cover shell-tool matching, Gemini wire fields, malformed
-    // tool_input handling, and preservation of host-supplied arguments.
+    // These tests cover fail-open malformed input, BeforeTool filtering,
+    // shell-tool matching including MCP patterns, and tool_input field
+    // preservation on rewrite.
 
     fn parse_gemini_output(output: &str) -> Value {
         serde_json::from_str(output).unwrap()
@@ -1751,6 +1752,8 @@ mod tests {
 
     #[test]
     fn test_is_gemini_shell_tool_matches_only_shell_tools() {
+        // MCP integration: mcp__<server>__run_shell_command should also route
+        // through RTK so MCP-served shell tools don't bypass safety rules.
         let cases = [
             ("run_shell_command", true),
             ("shell", true),
@@ -1779,29 +1782,41 @@ mod tests {
             "timeout": 30,
             "cwd": "/project"
         });
-        let v = parse_gemini_output(&gemini_json(
-            "allow",
-            Some("rtk git status"),
-            Some(&original),
-        ));
+        let out = gemini_json("allow", Some("rtk git status"), Some(&original));
+        let v = parse_gemini_output(&out);
         assert_eq!(v["decision"], "allow");
-        let tool_input = &v["hookSpecificOutput"]["tool_input"];
-        assert_eq!(tool_input["command"], "rtk git status");
-        assert_eq!(tool_input["timeout"], 30);
-        assert_eq!(tool_input["cwd"], "/project");
+        let ti = &v["hookSpecificOutput"]["tool_input"];
+        assert_eq!(ti["command"], "rtk git status");
+        assert_eq!(ti["timeout"], 30);
+        assert_eq!(ti["cwd"], "/project");
         assert!(v.get("modified_input").is_none());
         assert!(v.get("modifiedArgs").is_none());
     }
 
     #[test]
-    fn test_gemini_json_handles_missing_or_non_object_tool_input() {
+    fn test_gemini_json_no_rewrite_omits_hook_specific_output() {
+        // ask_user with no rewrite (Defer arm) — must NOT include
+        // hookSpecificOutput, otherwise Gemini may treat the missing
+        // tool_input as a directive to clear the command.
+        let out = gemini_json("ask_user", None, Some(&json!({"command": "ls"})));
+        let v = parse_gemini_output(&out);
+        assert_eq!(v["decision"], "ask_user");
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "hookSpecificOutput must be absent when rewrite is None, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_gemini_json_rewrite_builds_tool_input_object_defensively() {
+        // Defensive: if upstream caller passes None for original_tool_input
+        // or a non-object tool_input arrives with a rewrite, build an object
+        // containing only command.
         let non_object = json!("not-an-object");
         for original_tool_input in [None, Some(&non_object)] {
-            let v = parse_gemini_output(&gemini_json(
-                "allow",
-                Some("rtk git status"),
-                original_tool_input,
-            ));
+            let out = gemini_json("allow", Some("rtk git status"), original_tool_input);
+            let v = parse_gemini_output(&out);
             assert_eq!(
                 v["hookSpecificOutput"]["tool_input"]["command"],
                 "rtk git status"
@@ -1810,35 +1825,32 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_json_omits_tool_input_without_rewrite() {
-        let v = parse_gemini_output(&gemini_json(
-            "ask_user",
-            None,
-            Some(&json!({"command": "ls"})),
-        ));
-        assert_eq!(v["decision"], "ask_user");
-        assert!(v.get("hookSpecificOutput").is_none());
+    fn test_gemini_json_uses_decision_field_name() {
+        // Wire format conformance: Gemini expects "decision", not "result".
+        let out = gemini_json("allow", None, None);
+        let v = parse_gemini_output(&out);
+        assert!(v.get("decision").is_some(), "must have 'decision' field");
+        assert!(v.get("result").is_none(), "must NOT have 'result' field");
     }
 
     #[test]
-    fn test_gemini_json_uses_gemini_wire_fields() {
-        let v = parse_gemini_output(&gemini_json(
-            "allow",
-            Some("rtk ls"),
-            Some(&json!({"command": "ls"})),
-        ));
-        assert!(v.get("decision").is_some());
-        assert!(v.get("result").is_none());
+    fn test_gemini_json_uses_hookspecificoutput_field_name() {
+        // Wire format conformance: Gemini expects "hookSpecificOutput", not
+        // "modified_input" or "modifiedArgs".
+        let out = gemini_json("allow", Some("rtk ls"), Some(&json!({"command": "ls"})));
+        let v = parse_gemini_output(&out);
         assert!(v.get("hookSpecificOutput").is_some());
         assert!(v.get("modified_input").is_none());
         assert!(v.get("modifiedArgs").is_none());
     }
 
     #[test]
-    fn test_gemini_json_accepts_only_documented_decisions() {
-        for decision in ["allow", "deny", "ask_user"] {
-            let v = parse_gemini_output(&gemini_json(decision, None, None));
-            assert_eq!(v["decision"].as_str(), Some(decision));
+    fn test_gemini_json_decision_values() {
+        // Only "allow", "deny", and "ask_user" are valid Gemini decisions.
+        for val in ["allow", "deny", "ask_user"] {
+            let out = gemini_json(val, None, None);
+            let v = parse_gemini_output(&out);
+            assert_eq!(v["decision"].as_str().unwrap(), val);
         }
     }
 
