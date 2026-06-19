@@ -1550,37 +1550,31 @@ mod tests {
     // JSON, BeforeTool event filtering, broader shell-tool matching including
     // MCP patterns, and tool_input field preservation on rewrite.
 
-    #[test]
-    fn test_is_gemini_shell_tool_matches_canonical() {
-        assert!(is_gemini_shell_tool("run_shell_command"));
+    fn parse_gemini_output(output: &str) -> Value {
+        serde_json::from_str(output).unwrap()
     }
 
     #[test]
-    fn test_is_gemini_shell_tool_matches_alias() {
-        assert!(is_gemini_shell_tool("shell"));
-    }
-
-    #[test]
-    fn test_is_gemini_shell_tool_matches_mcp_pattern() {
+    fn test_is_gemini_shell_tool_matches_only_shell_tools() {
         // MCP integration: mcp__<server>__run_shell_command should also route
         // through RTK so MCP-served shell tools don't bypass safety rules.
-        assert!(is_gemini_shell_tool("mcp__rtk_local__run_shell_command"));
-        assert!(is_gemini_shell_tool("mcp____run_shell_command"));
-    }
+        let cases = [
+            ("run_shell_command", true),
+            ("shell", true),
+            ("mcp__rtk_local__run_shell_command", true),
+            ("mcp____run_shell_command", true),
+            ("read_file", false),
+            ("write_file", false),
+            ("search_code", false),
+            ("list_directory", false),
+            ("", false),
+        ];
 
-    #[test]
-    fn test_is_gemini_shell_tool_rejects_non_shell() {
-        for name in [
-            "read_file",
-            "write_file",
-            "search_code",
-            "list_directory",
-            "",
-        ] {
-            assert!(
-                !is_gemini_shell_tool(name),
-                "tool {} should not match",
-                name
+        for (tool_name, expected) in cases {
+            assert_eq!(
+                is_gemini_shell_tool(tool_name),
+                expected,
+                "tool match for {tool_name:?}"
             );
         }
     }
@@ -1595,12 +1589,14 @@ mod tests {
             "cwd": "/project"
         });
         let out = gemini_json("allow", Some("rtk git status"), Some(&original));
-        let v: Value = serde_json::from_str(&out).unwrap();
+        let v = parse_gemini_output(&out);
         assert_eq!(v["decision"], "allow");
         let ti = &v["hookSpecificOutput"]["tool_input"];
         assert_eq!(ti["command"], "rtk git status");
         assert_eq!(ti["timeout"], 30);
         assert_eq!(ti["cwd"], "/project");
+        assert!(v.get("modified_input").is_none());
+        assert!(v.get("modifiedArgs").is_none());
     }
 
     #[test]
@@ -1609,7 +1605,7 @@ mod tests {
         // hookSpecificOutput, otherwise Gemini may treat the missing
         // tool_input as a directive to clear the command.
         let out = gemini_json("ask_user", None, Some(&json!({"command": "ls"})));
-        let v: Value = serde_json::from_str(&out).unwrap();
+        let v = parse_gemini_output(&out);
         assert_eq!(v["decision"], "ask_user");
         assert!(
             v.get("hookSpecificOutput").is_none(),
@@ -1619,38 +1615,26 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_json_rewrite_with_missing_tool_input() {
+    fn test_gemini_json_rewrite_builds_tool_input_object_defensively() {
         // Defensive: if upstream caller passes None for original_tool_input
-        // but a rewrite is present, build an object containing only command.
-        let out = gemini_json("allow", Some("rtk git status"), None);
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
-        );
-    }
-
-    #[test]
-    fn test_gemini_json_rewrite_with_non_object_tool_input() {
-        // Defensive: if tool_input is somehow not an object (malformed input),
-        // gemini_json must still emit a valid object with command field.
-        let out = gemini_json(
-            "allow",
-            Some("rtk git status"),
-            Some(&json!("not-an-object")),
-        );
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(
-            v["hookSpecificOutput"]["tool_input"]["command"],
-            "rtk git status"
-        );
+        // or a non-object tool_input arrives with a rewrite, build an object
+        // containing only command.
+        let non_object = json!("not-an-object");
+        for original_tool_input in [None, Some(&non_object)] {
+            let out = gemini_json("allow", Some("rtk git status"), original_tool_input);
+            let v = parse_gemini_output(&out);
+            assert_eq!(
+                v["hookSpecificOutput"]["tool_input"]["command"],
+                "rtk git status"
+            );
+        }
     }
 
     #[test]
     fn test_gemini_json_uses_decision_field_name() {
         // Wire format conformance: Gemini expects "decision", not "result".
         let out = gemini_json("allow", None, None);
-        let v: Value = serde_json::from_str(&out).unwrap();
+        let v = parse_gemini_output(&out);
         assert!(v.get("decision").is_some(), "must have 'decision' field");
         assert!(v.get("result").is_none(), "must NOT have 'result' field");
     }
@@ -1660,7 +1644,7 @@ mod tests {
         // Wire format conformance: Gemini expects "hookSpecificOutput", not
         // "modified_input" or "modifiedArgs".
         let out = gemini_json("allow", Some("rtk ls"), Some(&json!({"command": "ls"})));
-        let v: Value = serde_json::from_str(&out).unwrap();
+        let v = parse_gemini_output(&out);
         assert!(v.get("hookSpecificOutput").is_some());
         assert!(v.get("modified_input").is_none());
         assert!(v.get("modifiedArgs").is_none());
@@ -1671,7 +1655,7 @@ mod tests {
         // Only "allow", "deny", and "ask_user" are valid Gemini decisions.
         for val in ["allow", "deny", "ask_user"] {
             let out = gemini_json(val, None, None);
-            let v: Value = serde_json::from_str(&out).unwrap();
+            let v = parse_gemini_output(&out);
             assert_eq!(v["decision"].as_str().unwrap(), val);
         }
     }
