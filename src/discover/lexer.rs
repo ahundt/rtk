@@ -272,6 +272,17 @@ fn flush_arg(tokens: &mut Vec<ParsedToken>, current: &mut String, offset: usize)
     }
 }
 
+/// Returns `true` when `cmd` contains a shell boundary that changes command
+/// sequencing or routing outside quoted strings.
+pub fn contains_compound_boundary(cmd: &str) -> bool {
+    tokenize(cmd).iter().any(is_compound_boundary_token)
+}
+
+fn is_compound_boundary_token(token: &ParsedToken) -> bool {
+    matches!(token.kind, TokenKind::Operator | TokenKind::Pipe)
+        || (token.kind == TokenKind::Shellism && token.value == "&")
+}
+
 /// True for constructs the permission gate can't decompose, so they must never
 /// be auto-allowed: command/process substitution, or a real file-target redirect
 /// (fd-dup like `2>&1` and `/dev/null` are exempt). Separators and subshells are
@@ -933,6 +944,58 @@ mod tests {
             .iter()
             .any(|t| t.kind == TokenKind::Shellism && t.value == "&"));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Redirect));
+    }
+
+    #[test]
+    fn test_compound_boundary_ignores_quoted_operator_text() {
+        for cmd in [
+            r#"git commit -m "Fix && Bug""#,
+            r#"git commit -m "a || b""#,
+            r#"git commit -m "end; here""#,
+            r#"git commit -m "left | right""#,
+            r#"git commit -m "x & y""#,
+            r#"git commit -m 'Fix && Bug'"#,
+        ] {
+            assert!(
+                !contains_compound_boundary(cmd),
+                "{cmd:?} should not contain a shell boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compound_boundary_detects_unquoted_shell_boundaries() {
+        for cmd in [
+            "git add . && cargo test",
+            "cmd1 || cmd2",
+            "cmd1 ; cmd2",
+            "git log | head",
+            "cargo test & git status",
+            "sleep 1 &",
+        ] {
+            assert!(
+                contains_compound_boundary(cmd),
+                "{cmd:?} should contain a shell boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compound_boundary_preserves_redirect_semantics() {
+        for cmd in [
+            "cargo test 2>&1",
+            "cargo test 1>&2",
+            "cargo test 2>&-",
+            "cargo test >&2",
+            "cargo test &>/dev/null",
+            "cargo test &>>/tmp/rtk.log",
+            r#"echo \&"#,
+        ] {
+            assert!(
+                !contains_compound_boundary(cmd),
+                "{cmd:?} should be a simple command for compound routing"
+            );
+        }
     }
 
     #[test]

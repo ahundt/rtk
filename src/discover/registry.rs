@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{contains_compound_boundary, split_on_operators, tokenize, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -504,12 +504,7 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    let has_compound = trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains('|')
-        || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !contains_compound_boundary(trimmed) && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
         return Some(trimmed.to_string());
     }
 
@@ -4155,6 +4150,34 @@ mod tests {
         assert_eq!(
             collapse_line_continuations("git diff HEAD~1"),
             std::borrow::Cow::<str>::Borrowed("git diff HEAD~1"),
+        );
+    }
+
+    #[test]
+    fn test_already_rtk_fastpath_uses_lexer_boundaries() {
+        // PR #536 / issue #361 edge case: quoted operators and fd redirects
+        // are still simple commands, so the already-rtk fast path must use the
+        // lexer rather than raw substring checks.
+        for cmd in [
+            r#"rtk git commit -m "Fix && Bug""#,
+            r#"rtk git commit -m "a || b""#,
+            r#"rtk git commit -m "end; here""#,
+            r#"rtk git commit -m "left | right""#,
+            r#"rtk git commit -m "x & y""#,
+            r#"rtk git commit -m 'Fix && Bug'"#,
+            "rtk cargo test 2>&1",
+            "rtk cargo test &>/dev/null",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(cmd.to_string()),
+                "{cmd:?} should use the already-rtk fast path"
+            );
+        }
+
+        assert_eq!(
+            rewrite_command_no_prefixes("rtk git status && cargo test", &[]),
+            Some("rtk git status && rtk cargo test".to_string())
         );
     }
 }
