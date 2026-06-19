@@ -464,9 +464,10 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
-/// For pipes (`|`), leaves the left-hand command raw unless the pipe tail is made
-/// only of display sinks such as `head`, `tail`, or `tee`, then continues rewriting
-/// segments after subsequent `&&`/`||`/`;` operators.
+/// For pipes (`|`), leaves the left-hand command raw for content-sensitive
+/// consumers. It rewrites the producer only when every remaining pipe stage is
+/// known to accept RTK-filtered output, then continues rewriting segments after
+/// subsequent `&&`/`||`/`;` operators.
 /// Also strips user-configured transparent wrapper prefixes
 /// (`[hooks].transparent_prefixes` in `config.toml`) before routing.
 ///
@@ -555,8 +556,9 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe => {
-                // Issue #1560: semantic consumers need raw input; display sinks
-                // can preserve useful rewrites such as `cargo test | tail -50`.
+                // Issue #1560: content-sensitive consumers need raw stdout.
+                // Recover rewrites only for pipe tails that accept RTK-filtered
+                // output, such as `cargo test | tail -50`.
                 let seg = cmd[seg_start..tok.offset].trim();
                 let pipe_group_end = tokens.iter().find(|t| {
                     t.offset > tok.offset
@@ -565,7 +567,7 @@ fn rewrite_compound(
                 });
                 let pipe_group_end_offset = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
                 let pipe_tail = cmd[tok.offset..pipe_group_end_offset].trim();
-                let rewritten = if is_display_sink_pipe_tail(pipe_tail) {
+                let rewritten = if pipe_tail_accepts_filtered_output(pipe_tail) {
                     rewrite_segment(seg, excluded, transparent_prefixes)
                         .unwrap_or_else(|| seg.to_string())
                 } else {
@@ -622,7 +624,7 @@ fn rewrite_compound(
     }
 }
 
-fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
+fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
     let tokens = tokenize(pipe_tail);
     if tokens.is_empty() {
         return false;
@@ -650,7 +652,7 @@ fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
             idx += 1;
         }
 
-        if !is_display_sink_stage(&cmd, &tokens[args_start..idx]) {
+        if !pipe_stage_accepts_filtered_output(&cmd, &tokens[args_start..idx]) {
             return false;
         }
         saw_stage = true;
@@ -659,22 +661,22 @@ fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
     saw_stage
 }
 
-fn is_display_sink_stage(cmd: &str, args: &[ParsedToken]) -> bool {
+fn pipe_stage_accepts_filtered_output(cmd: &str, args: &[ParsedToken]) -> bool {
     match cmd {
-        "head" | "tail" => is_head_tail_stdin_args(args),
+        "head" | "tail" => head_tail_reads_stdin_only(args),
         "tee" => true,
         "cat" => args.is_empty(),
         _ => false,
     }
 }
 
-fn is_head_tail_stdin_args(args: &[ParsedToken]) -> bool {
+fn head_tail_reads_stdin_only(args: &[ParsedToken]) -> bool {
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].value.as_str() {
             "-n" | "--lines" => {
                 idx += 1;
-                if idx >= args.len() || !is_positive_decimal(&args[idx].value) {
+                if idx >= args.len() || !is_decimal_count(&args[idx].value) {
                     return false;
                 }
             }
@@ -687,16 +689,14 @@ fn is_head_tail_stdin_args(args: &[ParsedToken]) -> bool {
 }
 
 fn is_short_line_count(value: &str) -> bool {
-    value.strip_prefix('-').is_some_and(is_positive_decimal)
+    value.strip_prefix('-').is_some_and(is_decimal_count)
 }
 
 fn is_long_line_count(value: &str) -> bool {
-    value
-        .strip_prefix("--lines=")
-        .is_some_and(is_positive_decimal)
+    value.strip_prefix("--lines=").is_some_and(is_decimal_count)
 }
 
-fn is_positive_decimal(value: &str) -> bool {
+fn is_decimal_count(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -1585,7 +1585,7 @@ mod tests {
         // Issue #1560: RTK summaries/compression can silently change the bytes
         // seen by downstream tools such as grep and head.
         // grep/head-with-file/cat-flags inspect output semantics, so the pipe
-        // input must stay raw even though display-only sinks can rewrite.
+        // input must stay raw even though display-bounding tails can rewrite.
         for cmd in [
             "ps aux | grep python | grep -v grep",
             "git log -10 | grep feat",
@@ -1601,11 +1601,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_lhs_rewrites_for_display_sinks() {
-        // Display sinks do not semantically filter the stream, so recovering
-        // RTK on the left-hand command keeps useful token savings.
+    fn test_pipe_lhs_rewrites_when_tail_accepts_filtered_output() {
+        // These pipe tails are used to bound or copy display output, so the
+        // producer can still use RTK's filtered output.
         for (cmd, rewritten) in [
             ("cargo test | head -5", "rtk cargo test | head -5"),
+            (
+                "cargo test | /usr/bin/head -5",
+                "rtk cargo test | /usr/bin/head -5",
+            ),
             (
                 "cargo test 2>&1 | tail -50",
                 "rtk cargo test 2>&1 | tail -50",
@@ -1619,7 +1623,7 @@ mod tests {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
                 Some(rewritten.into()),
-                "{cmd} should rewrite before display-only pipe sinks"
+                "{cmd} should rewrite before pipe tails that accept filtered output"
             );
         }
     }
@@ -1797,7 +1801,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
-        // A display sink can preserve the rewrite and the redirect suffix.
+        // This pipe tail accepts RTK-filtered output, so the redirect suffix is
+        // still preserved when the producer is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | head", &[]),
             Some("rtk cargo test 2>&1 | head".into())
@@ -4202,8 +4207,8 @@ mod tests {
 
     #[test]
     fn test_rewrite_resumes_after_pipe_group_operator() {
-        // The pipe group stays raw, but independent commands after &&, ||, or ;
-        // should still be rewritten.
+        // Apply the pipe-tail policy to the pipe group, then resume rewriting
+        // independent commands after &&, ||, or ;.
         for (cmd, rewritten) in [
             (
                 "git log | head -5 && git stash",
