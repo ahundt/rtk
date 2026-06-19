@@ -826,125 +826,113 @@ mod tests {
     // ----- is_json_deny --------------------------------------------------
 
     #[test]
-    fn test_is_json_deny_claude_code_format() {
-        let j = r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"r"}}"#;
-        assert!(is_json_deny(j));
-    }
+    fn test_is_json_deny_matches_only_supported_deny_shapes() {
+        let cases = [
+            (
+                "claude deny",
+                r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"r"}}"#,
+                true,
+            ),
+            ("gemini deny", r#"{"decision":"deny","reason":"r"}"#, true),
+            ("whitespace deny", "   \n  {\"decision\":\"deny\"}  ", true),
+            (
+                "claude allow",
+                r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#,
+                false,
+            ),
+            ("gemini allow", r#"{"decision":"allow"}"#, false),
+            ("empty", "", false),
+            ("malformed text", "not json", false),
+            ("malformed object", "{", false),
+        ];
 
-    #[test]
-    fn test_is_json_deny_gemini_format() {
-        let j = r#"{"decision":"deny","reason":"r"}"#;
-        assert!(is_json_deny(j));
-    }
-
-    #[test]
-    fn test_is_json_deny_allow_not_matched() {
-        assert!(!is_json_deny(
-            r#"{"hookSpecificOutput":{"permissionDecision":"allow"}}"#
-        ));
-        assert!(!is_json_deny(r#"{"decision":"allow"}"#));
-    }
-
-    #[test]
-    fn test_is_json_deny_empty_and_malformed() {
-        assert!(!is_json_deny(""));
-        assert!(!is_json_deny("not json"));
-        assert!(!is_json_deny("{"));
-    }
-
-    #[test]
-    fn test_is_json_deny_with_leading_whitespace() {
-        let j = "   \n  {\"decision\":\"deny\"}  ";
-        assert!(is_json_deny(j));
+        for (name, input, expected) in cases {
+            assert_eq!(is_json_deny(input), expected, "{name}");
+        }
     }
 
     // ----- extract_deny_reason -------------------------------------------
 
     #[test]
-    fn test_extract_deny_reason_cc_format() {
-        let j = r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Use grep"}}"#;
-        assert_eq!(extract_deny_reason(j), Some("Use grep".to_owned()));
-    }
+    fn test_extract_deny_reason_reads_supported_formats() {
+        let cases = [
+            (
+                r#"{"hookSpecificOutput":{"permissionDecision":"deny","permissionDecisionReason":"Use grep"}}"#,
+                Some("Use grep"),
+            ),
+            (r#"{"decision":"deny","reason":"blocked"}"#, Some("blocked")),
+            ("{}", None),
+            ("not json", None),
+        ];
 
-    #[test]
-    fn test_extract_deny_reason_gemini_format() {
-        let j = r#"{"decision":"deny","reason":"blocked"}"#;
-        assert_eq!(extract_deny_reason(j), Some("blocked".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_deny_reason_missing() {
-        assert_eq!(extract_deny_reason("{}"), None);
-        assert_eq!(extract_deny_reason("not json"), None);
+        for (input, expected) in cases {
+            assert_eq!(
+                extract_deny_reason(input),
+                expected.map(str::to_owned),
+                "{input}"
+            );
+        }
     }
 
     // ----- matcher helpers ----------------------------------------------
 
     #[test]
-    fn test_matcher_contains_bash_simple() {
-        assert!(matcher_contains_bash("Bash"));
-        assert!(matcher_contains_bash("Bash|Edit"));
-        assert!(matcher_contains_bash("Edit|Bash|Write"));
-    }
-
-    #[test]
     fn test_matcher_contains_bash_only_whole_token() {
         // Substring of another tool name MUST NOT count
-        assert!(!matcher_contains_bash("BashPipeline"));
-        assert!(!matcher_contains_bash("MyBash"));
-        assert!(!matcher_contains_bash("Edit|MyBash|Write"));
-    }
+        let cases = [
+            ("Bash", true),
+            ("Bash|Edit", true),
+            ("Edit|Bash|Write", true),
+            (" Bash ", true),
+            ("Edit | Bash | Write", true),
+            ("BashPipeline", false),
+            ("MyBash", false),
+            ("Edit|MyBash|Write", false),
+        ];
 
-    #[test]
-    fn test_matcher_contains_bash_with_whitespace() {
-        assert!(matcher_contains_bash(" Bash "));
-        assert!(matcher_contains_bash("Edit | Bash | Write"));
+        for (matcher, expected) in cases {
+            assert_eq!(matcher_contains_bash(matcher), expected, "{matcher}");
+        }
     }
 
     #[test]
     fn test_remove_bash_from_matcher() {
-        assert_eq!(remove_bash_from_matcher("Bash"), "");
-        assert_eq!(remove_bash_from_matcher("Bash|Edit"), "Edit");
-        assert_eq!(remove_bash_from_matcher("Edit|Bash|Write"), "Edit|Write");
-        assert_eq!(
-            remove_bash_from_matcher("Write|Edit|ExitPlanMode"),
-            "Write|Edit|ExitPlanMode"
-        );
-    }
-
-    #[test]
-    fn test_remove_bash_preserves_lookalikes() {
         // BashPipeline must survive
-        assert_eq!(
-            remove_bash_from_matcher("Bash|BashPipeline|Edit"),
-            "BashPipeline|Edit"
-        );
+        let cases = [
+            ("Bash", ""),
+            ("Bash|Edit", "Edit"),
+            ("Edit|Bash|Write", "Edit|Write"),
+            ("Write|Edit|ExitPlanMode", "Write|Edit|ExitPlanMode"),
+            ("Bash|BashPipeline|Edit", "BashPipeline|Edit"),
+        ];
+
+        for (matcher, expected) in cases {
+            assert_eq!(remove_bash_from_matcher(matcher), expected, "{matcher}");
+        }
     }
 
     // ----- parse_semver --------------------------------------------------
 
     #[test]
-    fn test_parse_semver_basic() {
-        assert_eq!(parse_semver("1.2.3"), (1, 2, 3));
-        assert_eq!(parse_semver("0.0.1"), (0, 0, 1));
-        assert_eq!(parse_semver("10.20.30"), (10, 20, 30));
-    }
-
-    #[test]
-    fn test_parse_semver_garbage_zero() {
-        assert_eq!(parse_semver("latest"), (0, 0, 0));
-        assert_eq!(parse_semver(""), (0, 0, 0));
+    fn test_parse_semver_documents_supported_and_edge_inputs() {
         // "v1" fails to parse so it is *dropped* by filter_map (not zeroed),
         // so the remaining segments slide left: "v1.2.3" → [2, 3] → (2, 3, 0).
         // Documents the actual behaviour so a future refactor does not
         // silently change version ordering for plugins with `v`-prefixed dirs.
-        assert_eq!(parse_semver("v1.2.3"), (2, 3, 0));
-    }
+        let cases = [
+            ("1.2.3", (1, 2, 3)),
+            ("0.0.1", (0, 0, 1)),
+            ("10.20.30", (10, 20, 30)),
+            ("latest", (0, 0, 0)),
+            ("", (0, 0, 0)),
+            ("v1.2.3", (2, 3, 0)),
+            ("2", (2, 0, 0)),
+            ("2.5", (2, 5, 0)),
+        ];
 
-    #[test]
-    fn test_parse_semver_partial() {
-        assert_eq!(parse_semver("2"), (2, 0, 0));
-        assert_eq!(parse_semver("2.5"), (2, 5, 0));
+        for (input, expected) in cases {
+            assert_eq!(parse_semver(input), expected, "{input}");
+        }
     }
 
     // ----- load_manifest behaviour --------------------------------------
