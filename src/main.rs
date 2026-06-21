@@ -1190,6 +1190,7 @@ const RTK_META_COMMANDS: &[&str] = &[
     "cc-economics",
     "verify",
     "trust",
+    "trash",
     "untrust",
     "session",
     "rewrite",
