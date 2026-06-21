@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_pipe_first_only() {
+    fn test_rewrite_pipe_content_sensitive_consumer_skipped() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
             None
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn test_pipe_lhs_stays_raw_for_semantic_consumers() {
         // Issue #1560: RTK summaries/compression can silently change the bytes
-        // seen by downstream tools such as grep and head.
+        // seen by downstream tools such as grep and head-with-file.
         // grep/head-with-file/cat-flags inspect output semantics, so the pipe
         // input must stay raw even though display-bounding tails can rewrite.
         for cmd in [

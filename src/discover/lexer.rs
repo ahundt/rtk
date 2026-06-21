@@ -387,7 +387,7 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
 /// respecting quoted strings via the lexer.
 ///
 /// When `stop_at_pipe` is true, returns only segments before the first `|`
-/// (used by command rewriting — only the left side of a pipe gets rewritten).
+/// (used by discovery paths that should not classify pipe consumers as rewrites).
 /// When false, splits through pipes too (used by permission checking —
 /// every segment must be validated).
 pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
