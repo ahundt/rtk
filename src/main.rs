@@ -2953,6 +2953,7 @@ mod tests {
             "kubectl",
             "oc",
             "summary",
+            "tail",
             "grep",
             "wget",
             "wc",
