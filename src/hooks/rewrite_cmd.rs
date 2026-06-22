@@ -1,6 +1,7 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
 use super::permissions::{check_command, PermissionVerdict};
+use crate::discover::lexer::{first_unattestable_construct, UnattestableConstruct};
 use crate::discover::registry;
 use std::io::Write;
 
@@ -59,15 +60,23 @@ fn evaluate_with_verdict(
         return RewriteOutcome::Deny;
     }
 
-    if crate::discover::lexer::contains_unattestable_construct(cmd) {
+    let unattestable = first_unattestable_construct(cmd);
+    if unattestable == Some(UnattestableConstruct::Substitution) {
         return RewriteOutcome::Passthrough;
     }
 
-    match registry::rewrite_command(cmd, excluded, transparent_prefixes) {
-        Some(rewritten) => match verdict {
-            PermissionVerdict::Allow => RewriteOutcome::Allow(rewritten),
-            _ => RewriteOutcome::Ask(rewritten),
-        },
+    match registry::rewrite_command_with_policy(cmd, excluded, transparent_prefixes) {
+        Some(rewrite) => {
+            if rewrite.requires_ask
+                || unattestable == Some(UnattestableConstruct::FileTargetRedirect)
+            {
+                RewriteOutcome::Ask(rewrite.command)
+            } else if verdict == PermissionVerdict::Allow {
+                RewriteOutcome::Allow(rewrite.command)
+            } else {
+                RewriteOutcome::Ask(rewrite.command)
+            }
+        }
         None => RewriteOutcome::Passthrough,
     }
 }
@@ -111,7 +120,6 @@ mod tests {
                     "double-quoted substitution",
                     "git log --pretty=\"$(rm -rf /tmp/x)\"",
                 ),
-                ("file redirect", "git log > /tmp/out.txt"),
             ] {
                 assert_eq!(
                     evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Default),
@@ -119,6 +127,71 @@ mod tests {
                     "{case} should pass through without consulting local permission files: {cmd}"
                 );
             }
+        }
+
+        #[test]
+        fn test_file_target_redirect_rewrites_as_ask_under_default_verdict() {
+            for (cmd, rewritten) in [
+                (
+                    "git status > /tmp/rtk-status.txt",
+                    "rtk git status > /tmp/rtk-status.txt",
+                ),
+                (
+                    "cargo test >> /tmp/rtk-test.log",
+                    "rtk cargo test >> /tmp/rtk-test.log",
+                ),
+                (
+                    "cargo test >> /tmp/rtk-test.log 2>&1 | tail -50",
+                    "rtk cargo test >> /tmp/rtk-test.log 2>&1 | tail -50",
+                ),
+            ] {
+                assert_eq!(
+                    evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Default),
+                    RewriteOutcome::Ask(rewritten.to_string()),
+                    "{cmd} should recover a rewrite but still require approval"
+                );
+            }
+        }
+
+        #[test]
+        fn test_file_target_redirect_never_auto_allows() {
+            assert_eq!(
+                evaluate_with_verdict(
+                    "git status > /tmp/rtk-status.txt",
+                    &[],
+                    &[],
+                    PermissionVerdict::Allow,
+                ),
+                RewriteOutcome::Ask("rtk git status > /tmp/rtk-status.txt".into()),
+                "file-target redirects must not become auto-allow rewrites"
+            );
+        }
+
+        #[test]
+        fn test_input_redirect_stays_passthrough() {
+            assert_eq!(
+                evaluate_with_verdict(
+                    "cat < /tmp/rtk-input.txt",
+                    &[],
+                    &[],
+                    PermissionVerdict::Default,
+                ),
+                RewriteOutcome::Passthrough,
+                "input redirects are not a safe output suffix to reattach"
+            );
+        }
+
+        #[test]
+        fn test_deny_still_wins_for_file_target_redirect() {
+            assert_eq!(
+                evaluate_with_verdict(
+                    "git status > /tmp/rtk-status.txt",
+                    &[],
+                    &[],
+                    PermissionVerdict::Deny,
+                ),
+                RewriteOutcome::Deny
+            );
         }
 
         #[test]
