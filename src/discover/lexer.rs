@@ -283,19 +283,37 @@ fn is_compound_boundary_token(token: &ParsedToken) -> bool {
         || (token.kind == TokenKind::Shellism && token.value == "&")
 }
 
-/// True for constructs the permission gate can't decompose, so they must never
-/// be auto-allowed: command/process substitution, or a real file-target redirect
-/// (fd-dup like `2>&1` and `/dev/null` are exempt). Separators and subshells are
-/// handled by [`split_for_permissions`], not flagged here.
-pub fn contains_unattestable_construct(cmd: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnattestableConstruct {
+    Substitution,
+    FileTargetRedirect,
+}
+
+/// Returns the first construct the permission gate can't decompose. These
+/// constructs must never be auto-allowed: command/process substitution, or a
+/// real file-target redirect (fd-dup like `2>&1` and `/dev/null` are exempt).
+/// Separators and subshells are handled by [`split_for_permissions`], not
+/// flagged here.
+pub fn first_unattestable_construct(cmd: &str) -> Option<UnattestableConstruct> {
     if contains_substitution(cmd) {
-        return true;
+        return Some(UnattestableConstruct::Substitution);
     }
     let tokens = tokenize(cmd);
-    tokens
+    if tokens
         .iter()
         .enumerate()
         .any(|(i, tok)| tok.kind == TokenKind::Redirect && redirect_has_file_target(&tokens, i))
+    {
+        Some(UnattestableConstruct::FileTargetRedirect)
+    } else {
+        None
+    }
+}
+
+/// True for constructs the permission gate can't decompose, so they must never
+/// be auto-allowed.
+pub fn contains_unattestable_construct(cmd: &str) -> bool {
+    first_unattestable_construct(cmd).is_some()
 }
 
 /// Quote-aware: bash runs backtick/`$(...)` unquoted and inside double quotes,
