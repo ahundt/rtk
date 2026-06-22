@@ -462,9 +462,9 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
-/// For pipes (`|`), leaves the left-hand command raw unless the pipe tail is made
-/// only of display sinks such as `head`, `tail`, or `tee`, then continues rewriting
-/// segments after subsequent `&&`/`||`/`;` operators.
+/// For pipes (`|`), leaves the left-hand command raw unless the pipe tail accepts
+/// RTK-filtered output without inspecting or saving the original stream, then
+/// continues rewriting segments after subsequent `&&`/`||`/`;` operators.
 /// Also strips user-configured transparent wrapper prefixes
 /// (`[hooks].transparent_prefixes` in `config.toml`) before routing.
 ///
@@ -568,7 +568,7 @@ fn rewrite_compound(
                 });
                 let pipe_group_end_offset = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
                 let pipe_tail = cmd[tok.offset..pipe_group_end_offset].trim();
-                let rewritten = if is_display_sink_pipe_tail(pipe_tail) {
+                let rewritten = if pipe_tail_accepts_filtered_output(pipe_tail) {
                     rewrite_segment(seg, excluded, transparent_prefixes)
                         .unwrap_or_else(|| seg.to_string())
                 } else {
@@ -625,7 +625,7 @@ fn rewrite_compound(
     }
 }
 
-fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
+fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
     let tokens = tokenize(pipe_tail);
     if tokens.is_empty() {
         return false;
@@ -653,7 +653,7 @@ fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
             idx += 1;
         }
 
-        if !is_display_sink_stage(&cmd, &tokens[args_start..idx]) {
+        if !pipe_stage_accepts_filtered_output(&cmd, &tokens[args_start..idx]) {
             return false;
         }
         saw_stage = true;
@@ -662,10 +662,9 @@ fn is_display_sink_pipe_tail(pipe_tail: &str) -> bool {
     saw_stage
 }
 
-fn is_display_sink_stage(cmd: &str, args: &[ParsedToken]) -> bool {
+fn pipe_stage_accepts_filtered_output(cmd: &str, args: &[ParsedToken]) -> bool {
     match cmd {
         "head" | "tail" => is_head_tail_stdin_args(args),
-        "tee" => true,
         "cat" => args.is_empty(),
         _ => false,
     }
@@ -1586,12 +1585,14 @@ mod tests {
     #[test]
     fn test_pipe_lhs_stays_raw_for_semantic_consumers() {
         // Issue #1560: RTK summaries/compression can silently change the bytes
-        // seen by downstream tools such as grep and head.
-        // grep/head-with-file/cat-flags inspect output semantics, so the pipe
-        // input must stay raw even though display-only sinks can rewrite.
+        // seen by downstream tools such as grep, tee logs, and head-with-file.
+        // Those consumers inspect, save, or depend on original command output,
+        // so the pipe input must stay raw even though display-bounding tails can
+        // rewrite.
         for cmd in [
             "ps aux | grep python | grep -v grep",
             "git log -10 | grep feat",
+            "cargo test | tee /tmp/rtk-test.log",
             "cargo test | head -5 src/lib.rs",
             "cargo test | cat -n",
         ] {
@@ -1604,25 +1605,21 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_lhs_rewrites_for_display_sinks() {
-        // Display sinks do not semantically filter the stream, so recovering
-        // RTK on the left-hand command keeps useful token savings.
+    fn test_pipe_lhs_rewrites_when_tail_accepts_filtered_output() {
+        // These tails bound or pass through RTK-filtered display output, so
+        // recovering RTK on the left-hand command keeps useful token savings.
         for (cmd, rewritten) in [
             ("cargo test | head -5", "rtk cargo test | head -5"),
             (
                 "cargo test 2>&1 | tail -50",
                 "rtk cargo test 2>&1 | tail -50",
             ),
-            (
-                "cargo test | tee /tmp/rtk-test.log",
-                "rtk cargo test | tee /tmp/rtk-test.log",
-            ),
             ("cargo test | cat", "rtk cargo test | cat"),
         ] {
             assert_eq!(
                 rewrite_command_no_prefixes(cmd, &[]),
                 Some(rewritten.into()),
-                "{cmd} should rewrite before display-only pipe sinks"
+                "{cmd} should rewrite before pipe tails that accept filtered output"
             );
         }
     }
