@@ -7,6 +7,7 @@ use super::lexer::{
     contains_compound_boundary, split_on_operators, tokenize, ParsedToken, TokenKind,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
+use super::suffix::{contains_unhandled_redirect, split_rewrite_suffix, SuffixSafety};
 
 /// Result of classifying a command.
 #[derive(Debug, PartialEq)]
@@ -21,6 +22,28 @@ pub enum Classification {
         base_command: String,
     },
     Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteResult {
+    pub command: String,
+    pub requires_ask: bool,
+}
+
+impl RewriteResult {
+    fn auto_allow(command: String) -> Self {
+        Self {
+            command,
+            requires_ask: false,
+        }
+    }
+
+    fn ask_only(command: String) -> Self {
+        Self {
+            command,
+            requires_ask: true,
+        }
+    }
 }
 
 /// Average token counts per category for estimation when no output_len available.
@@ -406,42 +429,6 @@ pub fn strip_disabled_prefix(cmd: &str) -> (&str, &str) {
     (prefix_part, rest)
 }
 
-fn strip_trailing_redirects(cmd: &str) -> (&str, &str) {
-    let tokens = tokenize(cmd);
-    if tokens.is_empty() {
-        return (cmd, "");
-    }
-
-    let mut redir_boundary = tokens.len();
-    let mut i = tokens.len();
-    while i > 0 {
-        i -= 1;
-        match tokens[i].kind {
-            TokenKind::Redirect => {
-                redir_boundary = i;
-            }
-            TokenKind::Arg => {
-                if i > 0 && tokens[i - 1].kind == TokenKind::Redirect {
-                    redir_boundary = i - 1;
-                    i -= 1;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    if redir_boundary >= tokens.len() {
-        return (cmd, "");
-    }
-
-    let cut = tokens[redir_boundary].offset;
-    let cmd_part = cmd[..cut].trim_end();
-    let redir_part = &cmd[cmd_part.len()..];
-    (cmd_part, redir_part)
-}
-
 lazy_static! {
     /// Matches a bash line-continuation: a backslash immediately followed by
     /// `\n` or `\r\n`, *plus* any horizontal whitespace on the line before AND
@@ -488,6 +475,14 @@ pub fn rewrite_command(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Option<String> {
+    rewrite_command_with_policy(cmd, excluded, transparent_prefixes).map(|result| result.command)
+}
+
+pub fn rewrite_command_with_policy(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+) -> Option<RewriteResult> {
     // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
     // follows are syntactically equivalent to a single space, but `cmd.trim()` does
     // not unwrap them so a leading backslash-newline used to defeat the whole matcher.
@@ -509,7 +504,11 @@ pub fn rewrite_command(
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
     if (trimmed.starts_with("rtk ") || trimmed == "rtk") && !contains_compound_boundary(trimmed) {
-        return Some(trimmed.to_string());
+        let suffix = split_rewrite_suffix(trimmed);
+        return Some(RewriteResult {
+            command: trimmed.to_string(),
+            requires_ask: suffix.safety == SuffixSafety::AskOnly,
+        });
     }
 
     rewrite_compound(trimmed, &compiled, &normalized_prefixes)
@@ -520,10 +519,11 @@ fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
-) -> Option<String> {
+) -> Option<RewriteResult> {
     let tokens = tokenize(cmd);
     let mut result = String::with_capacity(cmd.len() + 32);
     let mut any_changed = false;
+    let mut requires_ask = false;
     let mut seg_start: usize = 0;
 
     for tok in &tokens {
@@ -533,12 +533,16 @@ fn rewrite_compound(
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
-                if rewritten != seg {
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+                let command = rewritten
+                    .as_ref()
+                    .map(|r| r.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
                     any_changed = true;
                 }
-                result.push_str(&rewritten);
+                requires_ask |= rewritten.as_ref().is_some_and(|r| r.requires_ask);
+                result.push_str(command);
                 if tok.value == ";" {
                     result.push(';');
                     let after = tok.offset + tok.value.len();
@@ -569,14 +573,18 @@ fn rewrite_compound(
                 let pipe_tail = cmd[tok.offset..pipe_group_end_offset].trim();
                 let rewritten = if pipe_tail_accepts_filtered_output(pipe_tail) {
                     rewrite_segment(seg, excluded, transparent_prefixes)
-                        .unwrap_or_else(|| seg.to_string())
                 } else {
-                    seg.to_string()
+                    None
                 };
-                if rewritten != seg {
+                let command = rewritten
+                    .as_ref()
+                    .map(|r| r.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
                     any_changed = true;
                 }
-                result.push_str(&rewritten);
+                requires_ask |= rewritten.as_ref().is_some_and(|r| r.requires_ask);
+                result.push_str(command);
 
                 match pipe_group_end {
                     Some(next_op) => {
@@ -587,18 +595,29 @@ fn rewrite_compound(
                     None => {
                         result.push(' ');
                         result.push_str(cmd[tok.offset..].trim_start());
-                        return if any_changed { Some(result) } else { None };
+                        return if any_changed {
+                            Some(RewriteResult {
+                                command: result,
+                                requires_ask,
+                            })
+                        } else {
+                            None
+                        };
                     }
                 }
             }
             TokenKind::Shellism if tok.value == "&" => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
-                if rewritten != seg {
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+                let command = rewritten
+                    .as_ref()
+                    .map(|r| r.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
                     any_changed = true;
                 }
-                result.push_str(&rewritten);
+                requires_ask |= rewritten.as_ref().is_some_and(|r| r.requires_ask);
+                result.push_str(command);
                 result.push_str(" & ");
                 seg_start = tok.offset + tok.value.len();
                 while seg_start < cmd.len() && cmd.as_bytes().get(seg_start) == Some(&b' ') {
@@ -610,15 +629,22 @@ fn rewrite_compound(
     }
 
     let seg = cmd[seg_start..].trim();
-    let rewritten =
-        rewrite_segment(seg, excluded, transparent_prefixes).unwrap_or_else(|| seg.to_string());
-    if rewritten != seg {
+    let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+    let command = rewritten
+        .as_ref()
+        .map(|r| r.command.as_str())
+        .unwrap_or(seg);
+    if command != seg {
         any_changed = true;
     }
-    result.push_str(&rewritten);
+    requires_ask |= rewritten.as_ref().is_some_and(|r| r.requires_ask);
+    result.push_str(command);
 
     if any_changed {
-        Some(result)
+        Some(RewriteResult {
+            command: result,
+            requires_ask,
+        })
     } else {
         None
     }
@@ -792,7 +818,7 @@ fn rewrite_segment(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
-) -> Option<String> {
+) -> Option<RewriteResult> {
     rewrite_segment_inner(seg, excluded, transparent_prefixes, 0)
 }
 
@@ -808,7 +834,7 @@ fn rewrite_segment_inner(
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
     depth: usize,
-) -> Option<String> {
+) -> Option<RewriteResult> {
     let trimmed = seg.trim();
     if trimmed.is_empty() {
         return None;
@@ -831,7 +857,10 @@ fn rewrite_segment_inner(
         }
         let rewritten =
             rewrite_segment_inner(rest_after_env, excluded, transparent_prefixes, depth + 1)?;
-        return Some(format!("{}{}", env_prefix, rewritten));
+        return Some(RewriteResult {
+            command: format!("{}{}", env_prefix, rewritten.command),
+            requires_ask: rewritten.requires_ask,
+        });
     }
 
     for &prefix in BUILTIN_TRANSPARENT_PREFIXES {
@@ -839,8 +868,12 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1).map(
+                |rewritten| RewriteResult {
+                    command: format!("{} {}", prefix, rewritten.command),
+                    requires_ask: rewritten.requires_ask,
+                },
+            );
         }
     }
 
@@ -851,22 +884,40 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1).map(
+                |rewritten| RewriteResult {
+                    command: format!("{} {}", prefix, rewritten.command),
+                    requires_ask: rewritten.requires_ask,
+                },
+            );
         }
     }
 
-    // Strip trailing stderr/stdout redirects before matching (#530)
-    // e.g. "git status 2>&1" → match "git status", re-append " 2>&1"
-    let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
+    // Split trailing output-routing suffixes before matching (#530). File
+    // targets can be rewritten but must force ask; input redirects remain in
+    // `cmd_part` and are rejected below.
+    let suffix = split_rewrite_suffix(trimmed);
+    let cmd_part = suffix.core;
+    let redirect_suffix = suffix.suffix;
+    let requires_ask = suffix.safety == SuffixSafety::AskOnly;
 
     // Already RTK — pass through unchanged
     if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
-        return Some(trimmed.to_string());
+        return Some(RewriteResult {
+            command: trimmed.to_string(),
+            requires_ask,
+        });
+    }
+
+    if contains_unhandled_redirect(cmd_part) {
+        return None;
     }
 
     if cmd_part.starts_with("head -") || cmd_part.starts_with("tail ") {
-        return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
+        return rewrite_line_range(cmd_part).map(|r| RewriteResult {
+            command: format!("{}{}", r, redirect_suffix),
+            requires_ask,
+        });
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
@@ -904,7 +955,11 @@ fn rewrite_segment_inner(
                 parts.global_segment, parts.run_segment
             )
         };
-        return Some(rewritten);
+        return Some(if requires_ask {
+            RewriteResult::ask_only(format!("{}{}", rewritten, redirect_suffix))
+        } else {
+            RewriteResult::auto_allow(format!("{}{}", rewritten, redirect_suffix))
+        });
     }
 
     // #196: gh with --json/--jq/--template produces structured output that
@@ -927,7 +982,11 @@ fn rewrite_segment_inner(
             } else {
                 format!("{} {}{}", rule.rtk_cmd, rest, redirect_suffix)
             };
-            return Some(rewritten);
+            return Some(if requires_ask {
+                RewriteResult::ask_only(rewritten)
+            } else {
+                RewriteResult::auto_allow(rewritten)
+            });
         }
     }
 
@@ -956,6 +1015,10 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
+    }
+
+    fn rewrite_policy_no_prefixes(cmd: &str) -> Option<RewriteResult> {
+        super::rewrite_command_with_policy(cmd, &[], &[])
     }
 
     #[test]
@@ -1835,6 +1898,39 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test &>/dev/null", &[]),
             Some("rtk cargo test &>/dev/null".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_file_output_redirect_requires_ask_policy() {
+        let result = rewrite_policy_no_prefixes("git status > /tmp/rtk-status.txt")
+            .expect("supported command with output redirect should rewrite");
+        assert_eq!(result.command, "rtk git status > /tmp/rtk-status.txt");
+        assert!(
+            result.requires_ask,
+            "file-target output redirects must never auto-allow"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_file_output_redirect_before_safe_pipe_requires_ask_policy() {
+        let result = rewrite_policy_no_prefixes("cargo test >> /tmp/rtk-test.log 2>&1 | tail -50")
+            .expect("safe display pipe should not block producer rewrite");
+        assert_eq!(
+            result.command,
+            "rtk cargo test >> /tmp/rtk-test.log 2>&1 | tail -50"
+        );
+        assert!(
+            result.requires_ask,
+            "file-target output suffix before a safe pipe tail must force ask"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_input_redirect_is_not_recovered_as_suffix() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status < /tmp/input", &[]),
+            None
         );
     }
 
