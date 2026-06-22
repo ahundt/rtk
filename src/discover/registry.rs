@@ -664,7 +664,6 @@ fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
 fn pipe_stage_accepts_filtered_output(cmd: &str, args: &[ParsedToken]) -> bool {
     match cmd {
         "head" | "tail" => head_tail_reads_stdin_only(args),
-        "tee" => true,
         "cat" => args.is_empty(),
         _ => false,
     }
@@ -1589,6 +1588,7 @@ mod tests {
         for cmd in [
             "ps aux | grep python | grep -v grep",
             "git log -10 | grep feat",
+            "cargo test | tee /tmp/rtk-test.log",
             "cargo test | head -5 src/lib.rs",
             "cargo test | cat -n",
         ] {
@@ -1613,10 +1613,6 @@ mod tests {
             (
                 "cargo test 2>&1 | tail -50",
                 "rtk cargo test 2>&1 | tail -50",
-            ),
-            (
-                "cargo test | tee /tmp/rtk-test.log",
-                "rtk cargo test | tee /tmp/rtk-test.log",
             ),
             ("cargo test | cat", "rtk cargo test | cat"),
         ] {
