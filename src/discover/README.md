@@ -21,7 +21,7 @@ When a hook sends `cargo fmt --all && cargo test 2>&1 | tail -20`:
 → [Arg("cargo"), Arg("test"), Redirect("2>&1"), Operator("&&"), Arg("git"), Arg("status")]
 ```
 
-**Compound splitting** — The rewrite engine walks the tokens, splitting on `Operator` (`&&`, `||`, `;`) and pipe groups. Simple command segments are rewritten independently. Pipe producers stay raw when the pipe tail is content-sensitive (`grep`, `xargs`, `cat -n`, `head -5 file`) because RTK-filtered output can change what those consumers see. Pipe producers may still be rewritten when the remaining pipe stages accept filtered output (`head -20`, `tail -50`, `cat`, `tee`) so common display-limiting commands keep their token savings.
+**Compound splitting** — The rewrite engine walks the tokens, splitting on `Operator` (`&&`, `||`, `;`) and pipe groups. Simple command segments are rewritten independently. Pipe producers stay raw when the pipe tail is content-sensitive (`grep`, `xargs`, `tee`, `cat -n`, `head -5 file`) because RTK-filtered output can change what those consumers see or save. Pipe producers may still be rewritten when the remaining pipe stages only bound or pass through filtered display output (`head -20`, `tail -50`, `cat`) so common display-limiting commands keep their token savings.
 
 **Per-segment rewriting** — Each segment goes through:
 
