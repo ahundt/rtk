@@ -508,7 +508,7 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    if !contains_compound_boundary(trimmed) && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if (trimmed.starts_with("rtk ") || trimmed == "rtk") && !contains_compound_boundary(trimmed) {
         return Some(trimmed.to_string());
     }
 
