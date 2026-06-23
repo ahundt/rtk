@@ -2,7 +2,7 @@
 //! crate. Mirrors `rm`'s exit-code shape: silent on success, error on failure.
 
 use anyhow::Result;
-use std::{fmt::Display, path::Path};
+use std::fmt::Display;
 
 /// Move `paths` to the system trash.
 ///
@@ -28,8 +28,7 @@ where
         return Ok(false);
     }
 
-    let (existing, missing): (Vec<_>, Vec<_>) =
-        expanded.iter().partition(|p| Path::new(p).exists());
+    let (existing, missing): (Vec<_>, Vec<_>) = expanded.iter().partition(|p| path_exists(p));
 
     for p in &missing {
         eprintln!("trash: cannot remove '{}': No such path", p);
@@ -68,18 +67,23 @@ where
 
 /// Expand `~` or `~/...` to the current user's home directory.
 fn expand_tilde(path: &str) -> String {
-    if path == "~" || path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            if path == "~" {
-                return home.to_string_lossy().into_owned();
-            }
-            return home
-                .join(path.strip_prefix("~/").unwrap_or_default())
-                .to_string_lossy()
-                .into_owned();
-        }
+    let Some(home) = dirs::home_dir() else {
+        return path.to_string();
+    };
+    if path == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    if let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("~\\"))
+    {
+        return home.join(rest).to_string_lossy().into_owned();
     }
     path.to_string()
+}
+
+fn path_exists(path: &str) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 #[cfg(test)]
@@ -162,10 +166,11 @@ mod tests {
 
     #[test]
     fn expand_tilde_handles_only_current_user_home() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let cases = [
-            ("~", home.clone()),
-            ("~/src", format!("{home}/src")),
+            ("~", home.to_string_lossy().into_owned()),
+            ("~/src", home.join("src").to_string_lossy().into_owned()),
+            ("~\\src", home.join("src").to_string_lossy().into_owned()),
             ("/absolute/path", "/absolute/path".to_string()),
             ("~other/path", "~other/path".to_string()),
         ];
