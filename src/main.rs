@@ -116,7 +116,7 @@ enum Commands {
     Trash {
         /// Paths to move to trash (recoverable from the OS trash bin)
         #[arg(required = true, num_args = 1..)]
-        paths: Vec<String>,
+        paths: Vec<PathBuf>,
     },
 
     /// Generate 2-line technical summary (heuristic-based)
