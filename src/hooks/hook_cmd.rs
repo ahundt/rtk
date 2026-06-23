@@ -41,8 +41,8 @@ pub(crate) enum HookResponse {
     /// `process_claude_payload` maps a deny verdict to `NoOpinion`
     /// (matching upstream's documented behaviour), but the dispatcher
     /// already routes this variant to the exit-2 + dual-path-stderr
-    /// branch so the v3 permission PR can flip the mapping without
-    /// touching `run_claude`.
+    /// branch so future permission policy can change deny mapping without
+    /// touching the I/O dispatcher.
     #[allow(dead_code)]
     Deny(String, String),
 }
@@ -107,12 +107,8 @@ pub fn run_copilot() -> Result<()> {
         return Ok(());
     }
 
-    // FAIL-OPEN: invalid JSON → silent Ok. NEVER write to stderr at exit 0:
-    // Claude Code interprets ANY stderr at exit 0 as a hook error and
-    // proceeds anyway, but worse, ANY stderr corrupts piped JSON consumers
-    // downstream. The previous behavior here emitted a noisy parse error
-    // (bug present at upstream hook_cmd.rs:53) — silent return matches the
-    // Cursor handler at line 421 and the documented fail-open contract.
+    // Fail open on invalid JSON. Hook hosts parse stdout/stderr as protocol
+    // streams, so parse failures must not add stderr noise at exit 0.
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(_) => return Ok(()),
@@ -475,10 +471,9 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
 ///
 /// Fail-open: any parse or processing failure → `NoOpinion` so the host
 /// tool proceeds normally.
-fn run_claude_inner_v2(input: &str) -> HookResponse {
-    // Silent on parse failure: writing to stderr at exit 0 would be
-    // interpreted by Claude Code as a hook error (and corrupt downstream
-    // JSON consumers). Bug fix vs upstream hook_cmd.rs:368.
+fn claude_response_from_input(input: &str) -> HookResponse {
+    // Silent on parse failure: writing to stderr at exit 0 would corrupt the
+    // hook protocol and can be interpreted as a hook error by the host.
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(_) => return HookResponse::NoOpinion,
@@ -503,10 +498,10 @@ fn run_claude_inner_v2(input: &str) -> HookResponse {
 
 /// Run the Claude Code PreToolUse hook natively.
 ///
-/// Architecture (v3): single I/O point. `run_claude_inner_v2` returns a
-/// `HookResponse`; this function dispatches it and runs manifest
-/// fallthrough handlers from BOTH the NoOpinion and Allow paths so a
-/// displaced plugin's deny rules survive RTK's rewrite. See
+/// Single I/O point: `claude_response_from_input` returns a `HookResponse`;
+/// this function dispatches it and runs manifest fallthrough handlers from
+/// BOTH the NoOpinion and Allow paths so a displaced plugin's deny rules survive
+/// RTK's rewrite. See
 /// `manifest::run_manifest_handlers` for the fallthrough contract.
 pub fn run_claude() -> Result<()> {
     // Master toggle / recursion guard — skip silently if disabled.
@@ -530,14 +525,14 @@ pub fn run_claude() -> Result<()> {
         return Ok(());
     }
 
-    let response = run_claude_inner_v2(trimmed);
+    let response = claude_response_from_input(trimmed);
 
     match response {
         HookResponse::NoOpinion => {
             // RTK has no rewrite — give every manifest handler a chance.
-            // INVARIANT: pass ORIGINAL buffer (not trimmed) so handlers
-            // see exactly what Claude Code sent. Whitespace tolerance
-            // is the handler's problem to solve.
+            // Invariant: pass the original buffer (not trimmed) so handlers
+            // see exactly what Claude Code sent. Whitespace tolerance belongs
+            // to each handler.
             match run_manifest_handlers(&buffer) {
                 ManifestResult::Blocked { json, stderr_bytes } => {
                     let _ = writeln!(io::stdout(), "{json}");
@@ -1562,7 +1557,7 @@ mod tests {
         assert_eq!(v["decision"], "deny");
     }
 
-    // --- HookResponse / is_hook_disabled / run_claude_inner_v2 ---
+    // --- HookResponse / is_hook_disabled / claude_response_from_input ---
     //
     // These tests serialize via a mutex because they mutate process-wide
     // env vars. Tests share the lock with `recursion_guard::tests` to
@@ -1633,42 +1628,41 @@ mod tests {
     }
 
     #[test]
-    fn test_run_claude_inner_v2_no_opinion_on_malformed_json() {
+    fn test_claude_response_no_opinion_on_malformed_json() {
         // Critical regression test: must NOT write to stderr when JSON
         // parsing fails. The function returns NoOpinion (no I/O), and
-        // run_claude's NoOpinion path swallows it silently. Mirrors
-        // v2/cmd/hook/claude.rs:264.
-        let response = run_claude_inner_v2("not json at all");
+        // run_claude's NoOpinion path swallows it silently.
+        let response = claude_response_from_input("not json at all");
         assert_eq!(response, HookResponse::NoOpinion);
     }
 
     #[test]
-    fn test_run_claude_inner_v2_no_opinion_on_empty_object() {
-        let response = run_claude_inner_v2("{}");
+    fn test_claude_response_no_opinion_on_empty_object() {
+        let response = claude_response_from_input("{}");
         assert_eq!(response, HookResponse::NoOpinion);
     }
 
     #[test]
-    fn test_run_claude_inner_v2_no_opinion_on_missing_tool_input() {
-        let response = run_claude_inner_v2(r#"{"tool_name": "Bash"}"#);
+    fn test_claude_response_no_opinion_on_missing_tool_input() {
+        let response = claude_response_from_input(r#"{"tool_name": "Bash"}"#);
         assert_eq!(response, HookResponse::NoOpinion);
     }
 
     #[test]
-    fn test_run_claude_inner_v2_no_opinion_when_unmapped_command() {
+    fn test_claude_response_no_opinion_when_unmapped_command() {
         // `htop` has no rtk filter -> Skip { reason: "skip:no_match" }
         // which maps to NoOpinion. Manifest handlers still get a chance
         // via run_claude's dispatch.
         let payload = json!({"tool_name": "Bash", "tool_input": {"command": "htop"}}).to_string();
-        let response = run_claude_inner_v2(&payload);
+        let response = claude_response_from_input(&payload);
         assert_eq!(response, HookResponse::NoOpinion);
     }
 
     #[test]
-    fn test_run_claude_inner_v2_allow_when_rewritable() {
+    fn test_claude_response_allow_when_rewritable() {
         let payload =
             json!({"tool_name": "Bash", "tool_input": {"command": "git status"}}).to_string();
-        let response = run_claude_inner_v2(&payload);
+        let response = claude_response_from_input(&payload);
         match response {
             HookResponse::Allow(json) => {
                 let v: Value = serde_json::from_str(&json).unwrap();
@@ -1683,21 +1677,21 @@ mod tests {
     }
 
     #[test]
-    fn test_run_claude_inner_v2_passthrough_for_already_rtk() {
+    fn test_claude_response_passthrough_for_already_rtk() {
         let payload =
             json!({"tool_name": "Bash", "tool_input": {"command": "rtk git status"}}).to_string();
-        let response = run_claude_inner_v2(&payload);
+        let response = claude_response_from_input(&payload);
         assert_eq!(response, HookResponse::NoOpinion);
     }
 
     #[test]
-    fn test_run_claude_inner_v2_passthrough_for_heredoc() {
+    fn test_claude_response_passthrough_for_heredoc() {
         let payload = json!({
             "tool_name": "Bash",
             "tool_input": {"command": "cat <<EOF\nhello\nEOF"}
         })
         .to_string();
-        let response = run_claude_inner_v2(&payload);
+        let response = claude_response_from_input(&payload);
         assert_eq!(response, HookResponse::NoOpinion);
     }
 

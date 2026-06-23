@@ -6,10 +6,6 @@
 //! rewriting. The guard is a RAII drop — the variable is cleared even if a
 //! `panic!` unwinds through the call site, which prevents the env from
 //! leaking to subsequent test cases or interactive use.
-//!
-//! Ported from v2 `src/cmd/exec.rs:15-27`. Lives in its own module so other
-//! hook entry points (`run_claude`, `run_cursor`, `run_copilot`, `run_gemini`)
-//! can pull it in without touching the command-executor pipeline.
 
 /// Returns `true` when `RTK_ACTIVE` is set in the current environment.
 ///
