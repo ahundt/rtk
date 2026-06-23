@@ -4866,8 +4866,7 @@ mod tests {
 
     #[test]
     fn test_codex_mode_accepts_auto_patch() {
-        // v3 change (was: --codex --auto-patch rejected, before Codex shipped
-        // PreToolUse Bash interception). Now: --auto-patch ALSO writes
+        // Native Codex hook mode allows --auto-patch so install can write
         // ~/.codex/hooks.json. Use dry_run to avoid touching the real $HOME.
         let r = run(
             false,
@@ -4885,14 +4884,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(r.is_ok(), "--codex --auto-patch must succeed (v3): {r:?}");
+        assert!(r.is_ok(), "--codex --auto-patch must succeed: {r:?}");
     }
 
     #[test]
     fn test_codex_mode_accepts_no_patch() {
-        // v3 change: --codex --no-patch now means file-only mode
-        // (RTK.md + AGENTS.md, no hooks.json) — same as bare --codex.
-        // Use dry_run to avoid touching the real $HOME.
+        // --codex --no-patch is file-only mode: RTK.md + AGENTS.md,
+        // no hooks.json. Use dry_run to avoid touching the real $HOME.
         let r = run(
             false,
             false,
@@ -4909,7 +4907,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(r.is_ok(), "--codex --no-patch must succeed (v3): {r:?}");
+        assert!(r.is_ok(), "--codex --no-patch must succeed: {r:?}");
     }
 
     #[test]
