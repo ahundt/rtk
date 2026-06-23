@@ -1112,9 +1112,6 @@ fn clean_double_blanks(content: &str) -> String {
 /// Parse a semver-like version tuple `(major, minor, patch)` out of a string
 /// containing the literal `rtk-X.Y.Z` or `rtk/X.Y.Z` token (Homebrew Cellar,
 /// versioned install dirs, etc.). Returns `None` if no version token is found.
-///
-/// Ports the semver-aware path matching used by v2's `patch_plugin_caches`
-/// (commit 6fa5d1e) to settings.json hook command strings.
 fn parse_rtk_version_from_path(s: &str) -> Option<(u32, u32, u32)> {
     use lazy_static::lazy_static;
     use regex::Regex;
@@ -1174,10 +1171,9 @@ fn rtk_hook_version(cmd: &str) -> (u32, u32, u32) {
 /// Deep-merge RTK hook entry into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
 ///
-/// Per-version dedup (ports v2 commit 6fa5d1e concept to settings.json):
-/// when inserting, strip any pre-existing rtk hook entry whose embedded
+/// Per-version dedup: when inserting, strip any pre-existing rtk hook whose embedded
 /// `rtk-X.Y.Z` version is strictly older than `hook_command`'s version.
-/// Same- and newer-version entries are preserved (callers should check
+/// Same- and newer-version hooks are preserved (callers should check
 /// `hook_already_present` first to avoid no-op duplicate insertions).
 fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result<()> {
     let root_obj = match root.as_object_mut() {
@@ -1200,26 +1196,24 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
         .as_array_mut()
         .context("PreToolUse value is not an array")?;
 
-    // Per-version dedup: drop entries whose embedded rtk version is older
+    // Per-version dedup: drop hooks whose embedded rtk version is older
     // than the one we're inserting. Untouched: non-rtk hooks, same-version
     // rtk hooks, newer-version rtk hooks (downgrade prevention).
     let new_version = rtk_hook_version(hook_command);
-    pre_tool_use.retain(|entry| {
-        let Some(inner_hooks) = entry.get("hooks").and_then(|h| h.as_array()) else {
+    pre_tool_use.retain_mut(|entry| {
+        let mut removed_old_rtk_hook = false;
+        let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
             return true;
         };
-        // Keep the entry if any of its inner hook commands is NOT a strictly
-        // older rtk hook. This preserves entries that contain a mix of rtk
-        // and non-rtk handlers (rare, but possible in hand-edited configs).
-        inner_hooks.iter().any(|hook| {
+        inner_hooks.retain(|hook| {
             let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
                 return true;
             };
-            if !is_rtk_hook_command(cmd) {
-                return true;
-            }
-            rtk_hook_version(cmd) >= new_version
-        })
+            let remove = is_rtk_hook_command(cmd) && rtk_hook_version(cmd) < new_version;
+            removed_old_rtk_hook |= remove;
+            !remove
+        });
+        !removed_old_rtk_hook || !inner_hooks.is_empty()
     });
 
     pre_tool_use.push(serde_json::json!({
@@ -6267,10 +6261,8 @@ mod tests {
         assert!(json_content.get("hooks").is_some());
     }
 
-    // Per-version hook dedup tests (PR E: ports v2 commit 6fa5d1e dedup concept).
-    // The donor commit dedups by semver from filesystem paths inside
-    // patch_plugin_caches; the v3 adaptation applies the same idea to
-    // settings.json hook entries that reference different rtk binary paths.
+    // Per-version hook dedup tests for settings.json entries that reference
+    // different rtk binary paths.
 
     fn settings_with_pre_tool_use_command(command: &str) -> serde_json::Value {
         serde_json::json!({
@@ -6328,6 +6320,64 @@ mod tests {
         assert!(
             commands.contains(&CLAUDE_HOOK_COMMAND),
             "new bare CLAUDE_HOOK_COMMAND entry should be present; got: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_removes_older_rtk_command_from_mixed_entry() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "/opt/rtk-0.31.0/bin/rtk hook claude"
+                        },
+                        {
+                            "type": "command",
+                            "command": "/usr/local/bin/foreign-hook"
+                        }
+                    ]
+                }]
+            }
+        });
+
+        insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
+
+        let commands = hook_commands(&json_content);
+        assert!(
+            !commands.iter().any(|c| c.contains("rtk-0.31.0")),
+            "older rtk command should be removed from mixed entry; got: {commands:?}"
+        );
+        assert!(
+            commands.contains(&"/usr/local/bin/foreign-hook"),
+            "foreign command should be preserved in mixed entry; got: {commands:?}"
+        );
+        assert!(
+            commands.contains(&CLAUDE_HOOK_COMMAND),
+            "new rtk hook should be inserted after dedup; got: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_preserves_unrelated_empty_hook_entries() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Write",
+                    "hooks": []
+                }]
+            }
+        });
+
+        insert_hook_entry(&mut json_content, CLAUDE_HOOK_COMMAND).unwrap();
+
+        let pre_tool_use = json_content["hooks"][PRE_TOOL_USE_KEY].as_array().unwrap();
+        assert_eq!(
+            pre_tool_use.len(),
+            2,
+            "unrelated empty hook entry should be preserved alongside new RTK hook"
         );
     }
 
