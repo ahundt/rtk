@@ -680,6 +680,7 @@ pub fn run_claude() -> Result<()> {
 
     let trimmed = buffer.trim();
     if trimmed.is_empty() {
+        write_no_opinion_stdout();
         return Ok(());
     }
 
@@ -701,7 +702,7 @@ pub fn run_claude() -> Result<()> {
                     std::process::exit(2);
                 }
                 ManifestResult::NoBlock => {
-                    // Implicit allow — exit 0, no output.
+                    write_no_opinion_stdout();
                 }
             }
         }
@@ -742,6 +743,12 @@ pub fn run_claude() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn write_no_opinion_stdout() {
+    // Issue #1773: Claude Code expects valid JSON for "no opinion"; zero bytes
+    // can be treated as a malformed hook response.
+    let _ = writeln!(io::stdout(), "{{}}");
 }
 
 #[cfg(test)]
@@ -1505,44 +1512,35 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_no_rewrite_emits_empty_object() {
-        // Commands RTK cannot rewrite must still emit valid JSON.
-        let out = run_claude_stdout(&claude_input("head -c 100 /etc/hosts"));
-        assert_eq!(out, "{}\n");
-    }
-
-    #[test]
-    fn test_claude_unknown_command_emits_empty_object() {
-        let out = run_claude_stdout(&claude_input("htop"));
-        assert_eq!(out, "{}\n");
-    }
-
-    #[test]
-    fn test_claude_empty_command_emits_empty_object() {
-        let input = json!({
+    fn test_claude_no_opinion_cases_emit_empty_object() {
+        // These no-rewrite and invalid-input paths must emit `{}` rather than
+        // empty stdout so Claude Code can proceed with the original command.
+        let empty_command = json!({
             "tool_name": "Bash",
             "tool_input": { "command": "" }
         })
         .to_string();
-        assert_eq!(run_claude_stdout(&input), "{}\n");
-    }
+        let missing_tool_input = json!({ "tool_name": "Bash" }).to_string();
 
-    #[test]
-    fn test_claude_missing_tool_input_emits_empty_object() {
-        let input = json!({ "tool_name": "Bash" }).to_string();
-        assert_eq!(run_claude_stdout(&input), "{}\n");
-    }
-
-    #[test]
-    fn test_claude_empty_input_emits_empty_object() {
-        assert_eq!(run_claude_stdout(""), "{}\n");
-        assert_eq!(run_claude_stdout("   "), "{}\n");
-        assert_eq!(run_claude_stdout("\n\n"), "{}\n");
-    }
-
-    #[test]
-    fn test_claude_malformed_json_emits_empty_object() {
-        assert_eq!(run_claude_stdout("not valid json {{{"), "{}\n");
+        for (case, input) in [
+            (
+                "unsupported command",
+                claude_input("head -c 100 /etc/hosts"),
+            ),
+            ("unknown command", claude_input("htop")),
+            ("empty command", empty_command),
+            ("missing tool_input", missing_tool_input),
+            ("empty input", String::new()),
+            ("whitespace input", "   ".to_string()),
+            ("newline-only input", "\n\n".to_string()),
+            ("malformed json", "not valid json {{{".to_string()),
+        ] {
+            assert_eq!(
+                run_claude_stdout(&input),
+                "{}\n",
+                "{case} should emit valid no-opinion JSON"
+            );
+        }
     }
 
     #[test]
