@@ -4297,6 +4297,7 @@ mod tests {
         );
     }
 
+    // --- Pipe + operator rewrite ---
     #[test]
     fn test_rewrite_resumes_after_pipe_group_operator() {
         // Apply the pipe-tail policy to the pipe group, then resume rewriting
