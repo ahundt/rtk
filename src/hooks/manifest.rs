@@ -6,8 +6,8 @@
 //! field when more than one registered plugin matches the same tool (open
 //! issue: <https://github.com/rtk-ai/rtk/issues/1515>). Two plugins that both
 //! register a `Bash` matcher therefore *race* — only one rewrite reaches
-//! the agent and there is no error reported back. RTK is the most-installed
-//! Bash hook and consequently the one that gets squashed.
+//! the agent and there is no error reported back. RTK's rewrite can
+//! consequently be squashed by another matching Bash hook.
 //!
 //! ## Two-phase fix
 //!
@@ -15,7 +15,7 @@
 //! `~/.claude/plugins/cache/*/*/<version>/hooks/*.json`, find every
 //! PreToolUse entry whose matcher contains `Bash`, strip the `Bash` token
 //! out of the pipe-separated alternation, and record both the original
-//! matcher and the original `command` string in
+//! matcher and the original command hooks in
 //! `~/.claude/hooks/rtk-bash-manifest.json`. After this step RTK is the
 //! only plugin still claiming Bash.
 //!
@@ -23,13 +23,7 @@
 //! claude` runs, it forwards the *original* payload to every command in
 //! the manifest, gives any of them the chance to deny the request, and
 //! only emits its own rewrite if none of them did. This preserves
-//! cooperating plugins' safety semantics (autorun's deny rules, for
-//! example) on top of RTK's rewrite.
-//!
-//! Ported from v2 `src/init.rs` (`patch_plugin_caches`, `BashManifest`,
-//! `ManifestEntry`) and v2 `src/cmd/hook/claude.rs`
-//! (`run_manifest_handlers`, `ManifestResult`, `is_json_deny`,
-//! `extract_deny_reason`). Layout adapted to upstream's `src/hooks/` split.
+//! cooperating plugins' safety semantics on top of RTK's rewrite.
 //!
 //! I/O contract: `run_manifest_handlers` MUST NEVER write to stdout/stderr
 //! — its caller (`hook_cmd::run_claude`) is the single I/O point and any
@@ -69,15 +63,30 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 /// `cache_path` is the absolute path to the patched cache file (so uninstall
 /// can find the file to restore). `original_matcher` / `patched_matcher`
 /// record the matcher transformation so install is idempotent and uninstall
-/// can put `Bash` back. `fallthrough_command` is the *resolved* command line
-/// (with `${CLAUDE_PLUGIN_ROOT}` expanded to an absolute path) that RTK now
-/// invokes on behalf of the displaced plugin.
+/// can put `Bash` back. `fallthrough_command` is the legacy single-command
+/// field; `fallthrough_commands` are the resolved command lines (with
+/// `${CLAUDE_PLUGIN_ROOT}` expanded to absolute paths) that RTK invokes on
+/// behalf of the displaced plugin.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestEntry {
     pub(crate) cache_path: String,
     pub(crate) original_matcher: String,
     pub(crate) patched_matcher: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) fallthrough_command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) fallthrough_commands: Vec<String>,
+}
+
+impl ManifestEntry {
+    fn commands(&self) -> impl Iterator<Item = &str> + '_ {
+        let legacy_command = self.fallthrough_command.as_str();
+        self.fallthrough_commands.iter().map(String::as_str).chain(
+            std::iter::once(legacy_command).filter(move |_| {
+                self.fallthrough_commands.is_empty() && !legacy_command.is_empty()
+            }),
+        )
+    }
 }
 
 /// On-disk schema for `~/.claude/hooks/rtk-bash-manifest.json`.
@@ -290,8 +299,8 @@ fn is_entry_active(entry: &ManifestEntry) -> bool {
 /// would defeat handler-level safety checks.
 ///
 /// Stale-entry guard: each entry is checked by `is_entry_active` before
-/// dispatch so a plugin update (v1→v2) does not dispatch the frozen v1
-/// `fallthrough_command` whose `${CLAUDE_PLUGIN_ROOT}` was resolved to
+/// dispatch so a plugin update (v1→v2) does not dispatch frozen v1
+/// fallthrough commands whose `${CLAUDE_PLUGIN_ROOT}` was resolved to
 /// the now-superseded version directory. `rtk init` re-runs are still
 /// the canonical refresh path; this guard prevents the wrong-version
 /// dispatch in between init runs.
@@ -318,40 +327,42 @@ pub(crate) fn run_manifest_handlers(payload: &str) -> ManifestResult {
         if !is_entry_active(entry) {
             continue;
         }
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&entry.fallthrough_command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => continue, // fail-open: handler binary not found
-        };
+        for command in entry.commands() {
+            let mut child = match Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => continue, // fail-open: handler binary not found
+            };
 
-        // Track stdin write success so a failed write does not let the
-        // child observe an empty payload and falsely emit exit 2.
-        let write_ok = if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(payload.as_bytes()).is_ok()
-        } else {
-            false
-        };
+            // Track stdin write success so a failed write does not let the
+            // child observe an empty payload and falsely emit exit 2.
+            let write_ok = if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(payload.as_bytes()).is_ok()
+            } else {
+                false
+            };
 
-        let output = match child.wait_with_output() {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
+            let output = match child.wait_with_output() {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
 
-        let exit_code = output.status.code().unwrap_or(0);
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let blocked = (exit_code == 2 && write_ok) || is_json_deny(&stdout_str);
+            let exit_code = output.status.code().unwrap_or(0);
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let blocked = (exit_code == 2 && write_ok) || is_json_deny(&stdout_str);
 
-        if blocked && block_json.is_none() {
-            // Record FIRST block; loop still runs ALL handlers so each
-            // handler can side-effect (audit logs, telemetry, etc.).
-            block_json = Some(stdout_str.into_owned());
-            block_stderr.extend_from_slice(&output.stderr);
+            if blocked && block_json.is_none() {
+                // Record FIRST block; loop still runs ALL handlers so each
+                // handler can side-effect (audit logs, telemetry, etc.).
+                block_json = Some(stdout_str.into_owned());
+                block_stderr.extend_from_slice(&output.stderr);
+            }
         }
     }
 
@@ -535,21 +546,11 @@ fn patch_single_cache_file(
             if matcher.is_empty() {
                 continue;
             }
-            let command = entry
-                .get("hooks")
-                .and_then(|h| h.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|h| h.get("command"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            let resolved_command = resolve_plugin_root_in_command(
-                &command,
-                vendor_name,
-                plugin_name,
-                settings_root,
-                claude_dir,
-            );
+            let commands =
+                resolved_hook_commands(entry, vendor_name, plugin_name, settings_root, claude_dir);
+            if commands.is_empty() {
+                continue;
+            }
             if verbose > 0 {
                 eprintln!(
                     "Reconstructed manifest entry for '{}' (Bash already removed)",
@@ -560,7 +561,8 @@ fn patch_single_cache_file(
                 cache_path: cache_path_str.clone(),
                 original_matcher: matcher.clone(),
                 patched_matcher: matcher,
-                fallthrough_command: resolved_command,
+                fallthrough_command: String::new(),
+                fallthrough_commands: commands,
             });
             any_added = true;
         }
@@ -580,22 +582,11 @@ fn patch_single_cache_file(
             continue;
         }
 
-        let command = entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|h| h.get("command"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let resolved_command = resolve_plugin_root_in_command(
-            &command,
-            vendor_name,
-            plugin_name,
-            settings_root,
-            claude_dir,
-        );
+        let commands =
+            resolved_hook_commands(entry, vendor_name, plugin_name, settings_root, claude_dir);
+        if commands.is_empty() {
+            continue;
+        }
         let new_matcher = remove_bash_from_matcher(&matcher);
 
         // Empty matcher would silently disable the entire entry; skip
@@ -620,7 +611,8 @@ fn patch_single_cache_file(
             cache_path: cache_path_str.clone(),
             original_matcher: matcher,
             patched_matcher: new_matcher,
-            fallthrough_command: resolved_command,
+            fallthrough_command: String::new(),
+            fallthrough_commands: commands,
         });
 
         any_patched = true;
@@ -636,6 +628,32 @@ fn patch_single_cache_file(
     }
 
     Ok(any_patched)
+}
+
+fn resolved_hook_commands(
+    entry: &Value,
+    vendor_name: &str,
+    plugin_name: &str,
+    settings_root: &Value,
+    claude_dir: &Path,
+) -> Vec<String> {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(|c| c.as_str()))
+        .filter(|command| !command.is_empty())
+        .map(|command| {
+            resolve_plugin_root_in_command(
+                command,
+                vendor_name,
+                plugin_name,
+                settings_root,
+                claude_dir,
+            )
+        })
+        .collect()
 }
 
 /// Scan every plugin cache for `Bash` matchers, strip them, and write a
@@ -980,7 +998,8 @@ mod tests {
                 cache_path: "/tmp/cache/x.json".to_string(),
                 original_matcher: "Bash|Edit".to_string(),
                 patched_matcher: "Edit".to_string(),
-                fallthrough_command: "/usr/local/bin/handler".to_string(),
+                fallthrough_command: String::new(),
+                fallthrough_commands: vec!["/usr/local/bin/handler".to_string()],
             }],
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -988,6 +1007,26 @@ mod tests {
         assert_eq!(back.entries.len(), 1);
         assert_eq!(back.entries[0].original_matcher, "Bash|Edit");
         assert_eq!(back.entries[0].patched_matcher, "Edit");
+        assert_eq!(
+            back.entries[0].commands().collect::<Vec<_>>(),
+            vec!["/usr/local/bin/handler"]
+        );
+    }
+
+    #[test]
+    fn test_manifest_entry_commands_supports_legacy_single_command() {
+        let entry = ManifestEntry {
+            cache_path: "/tmp/cache/x.json".to_string(),
+            original_matcher: "Bash|Edit".to_string(),
+            patched_matcher: "Edit".to_string(),
+            fallthrough_command: "/usr/local/bin/legacy-handler".to_string(),
+            fallthrough_commands: Vec::new(),
+        };
+
+        assert_eq!(
+            entry.commands().collect::<Vec<_>>(),
+            vec!["/usr/local/bin/legacy-handler"]
+        );
     }
 
     #[test]
@@ -1042,7 +1081,10 @@ mod tests {
                 "PreToolUse": [
                     {
                         "matcher": "Write|Edit|Bash|ExitPlanMode",
-                        "hooks": [{"type": "command", "command": "/usr/local/bin/plugin-y"}]
+                        "hooks": [
+                            {"type": "command", "command": "/usr/local/bin/plugin-y"},
+                            {"type": "command", "command": "/usr/local/bin/plugin-y-audit"}
+                        ]
                     }
                 ]
             }
@@ -1071,7 +1113,13 @@ mod tests {
             "Write|Edit|Bash|ExitPlanMode"
         );
         assert_eq!(m.entries[0].patched_matcher, "Write|Edit|ExitPlanMode");
-        assert_eq!(m.entries[0].fallthrough_command, "/usr/local/bin/plugin-y");
+        assert_eq!(
+            m.entries[0].fallthrough_commands,
+            vec![
+                "/usr/local/bin/plugin-y".to_string(),
+                "/usr/local/bin/plugin-y-audit".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -1220,7 +1268,7 @@ mod tests {
         assert_eq!(m.entries.len(), 1);
         assert_eq!(m.entries[0].original_matcher, "Write|Edit");
         assert_eq!(m.entries[0].patched_matcher, "Write|Edit");
-        assert_eq!(m.entries[0].fallthrough_command, "/x");
+        assert_eq!(m.entries[0].fallthrough_commands, vec!["/x".to_string()]);
     }
 
     #[test]
@@ -1250,7 +1298,7 @@ mod tests {
     // ----- is_entry_active: stale-entry runtime guard --------------------
     //
     // Issue: BashManifest entries bake the absolute path of the active
-    // version dir into `fallthrough_command` at install time. When a
+    // version dir into fallthrough command strings at install time. When a
     // plugin updates v1.0.0 → v2.5.0 between `rtk init` runs the stored
     // command still points at v1 — dispatching it executes stale logic or
     // crashes silently. `is_entry_active` is the runtime safety net.
@@ -1261,6 +1309,7 @@ mod tests {
             original_matcher: "Bash|Edit".to_string(),
             patched_matcher: "Edit".to_string(),
             fallthrough_command: "echo placeholder".to_string(),
+            fallthrough_commands: Vec::new(),
         }
     }
 
