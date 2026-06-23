@@ -1339,11 +1339,9 @@ mod tests {
 
     #[test]
     fn test_is_entry_active_old_version_when_newer_exists() {
-        // The exact scenario the user hit: plugin updated from 1.0.0 to
-        // 2.5.0, but the old cache dir survived (lazy GC). The entry's
-        // cache_path still resolves but it is no longer the active
-        // version — runtime MUST skip it so the v1 handler does not run
-        // against v2 payloads.
+        // Regression scenario: a plugin updates from 1.0.0 to 2.5.0 while the
+        // old cache directory survives lazy garbage collection. The entry's
+        // cache_path still resolves, but it is no longer the active version.
         let tmp = tempfile::tempdir().unwrap();
         let plugin_dir = tmp.path().join("plugins/cache/vendor/plug");
         let old_hook = plugin_dir.join("1.0.0/hooks/h.json");
