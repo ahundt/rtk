@@ -1084,8 +1084,11 @@ where
     }
 
     if !pending_summary_line.is_empty() {
-        writer.write_all(&pending_summary_line)?;
-        writer.flush()?;
+        let line = String::from_utf8_lossy(&pending_summary_line);
+        if commit_summary_from_line(&line).is_none() {
+            writer.write_all(&pending_summary_line)?;
+            writer.flush()?;
+        }
     }
 
     Ok(captured)
@@ -2605,14 +2608,24 @@ no changes added to commit (use "git add" and/or "git commit -a")
 
     #[test]
     fn test_stream_commit_stdout_suppresses_git_success_line() {
-        let input = b"pre-commit stdout\n[main abc1234def] add feature\npost-commit stdout\n";
-        let (captured, output) = stream_commit_stdout_for_test(input);
+        for (case, input, expected) in [
+            (
+                "summary line between hook output",
+                b"pre-commit stdout\n[main abc1234def] add feature\npost-commit stdout\n"
+                    .as_slice(),
+                b"pre-commit stdout\npost-commit stdout\n".as_slice(),
+            ),
+            (
+                "summary line without trailing newline",
+                b"[main abc1234def] add feature".as_slice(),
+                b"".as_slice(),
+            ),
+        ] {
+            let (captured, output) = stream_commit_stdout_for_test(input);
 
-        assert_eq!(captured, input);
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "pre-commit stdout\npost-commit stdout\n"
-        );
+            assert_eq!(captured, input);
+            assert_eq!(output, expected, "{case}: streamed output changed");
+        }
     }
 
     #[test]
