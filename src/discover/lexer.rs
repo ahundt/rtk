@@ -345,13 +345,18 @@ fn contains_substitution(cmd: &str) -> bool {
 
 // `>&N`/`>&-` (and `N>&M`) is fd-dup/close; bare `>&` before a word is
 // `>word 2>&1` — a file target.
+pub(super) fn redirect_is_fd_dup_or_close(value: &str) -> bool {
+    let Some(pos) = value.find(">&") else {
+        return false;
+    };
+    let tail = &value[pos + 2..];
+    !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
 fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
     let value = &tokens[i].value;
-    if let Some(pos) = value.find(">&") {
-        let tail = &value[pos + 2..];
-        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-') {
-            return false;
-        }
+    if redirect_is_fd_dup_or_close(value) {
+        return false;
     }
     match tokens.get(i + 1) {
         Some(next) if next.kind == TokenKind::Arg => next.value != "/dev/null",
