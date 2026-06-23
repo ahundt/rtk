@@ -1,19 +1,19 @@
 //! Lexer-backed suffix handling for shell output routing that can be safely
 //! reattached after a command rewrite.
 
-use super::lexer::{tokenize, ParsedToken, TokenKind};
+use super::lexer::{redirect_is_fd_dup_or_close, tokenize, ParsedToken, TokenKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SuffixSafety {
+pub(super) enum SuffixSafety {
     AutoAllow,
     AskOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RewriteSuffix<'a> {
-    pub core: &'a str,
-    pub suffix: &'a str,
-    pub safety: SuffixSafety,
+pub(super) struct RewriteSuffix<'a> {
+    pub(super) core: &'a str,
+    pub(super) suffix: &'a str,
+    pub(super) safety: SuffixSafety,
 }
 
 /// Split off trailing output-routing suffixes while preserving their original
@@ -21,7 +21,7 @@ pub struct RewriteSuffix<'a> {
 ///
 /// Input redirects, heredocs, process substitutions, and redirects in the
 /// command middle are left in `core` so callers can reject them conservatively.
-pub fn split_rewrite_suffix(cmd: &str) -> RewriteSuffix<'_> {
+pub(super) fn split_rewrite_suffix(cmd: &str) -> RewriteSuffix<'_> {
     let tokens = tokenize(cmd);
     let mut boundary = tokens.len();
     let mut safety = SuffixSafety::AutoAllow;
@@ -73,7 +73,7 @@ pub fn split_rewrite_suffix(cmd: &str) -> RewriteSuffix<'_> {
     }
 }
 
-pub fn contains_unhandled_redirect(cmd: &str) -> bool {
+pub(super) fn contains_unhandled_redirect(cmd: &str) -> bool {
     tokenize(cmd)
         .iter()
         .any(|token| token.kind == TokenKind::Redirect)
@@ -92,7 +92,7 @@ fn classify_redirect(tokens: &[ParsedToken], idx: usize) -> Option<RedirectPart>
         return None;
     }
 
-    if is_fd_dup_or_close(value) {
+    if redirect_is_fd_dup_or_close(value) {
         return Some(RedirectPart {
             safety: SuffixSafety::AutoAllow,
             consumes_target: false,
@@ -120,14 +120,6 @@ fn classify_redirect(tokens: &[ParsedToken], idx: usize) -> Option<RedirectPart>
 
 fn is_input_redirect(value: &str) -> bool {
     value.starts_with('<')
-}
-
-fn is_fd_dup_or_close(value: &str) -> bool {
-    let Some(pos) = value.find(">&") else {
-        return false;
-    };
-    let tail = &value[pos + 2..];
-    !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit() || b == b'-')
 }
 
 fn requires_output_target(value: &str) -> bool {
