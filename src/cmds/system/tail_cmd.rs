@@ -5,13 +5,9 @@
 //! - Prefixing each line with a numeric index (right-aligned, padded)
 //! - Collapsing long bodies with a `... N lines skipped ...` marker so
 //!   massive `tail` invocations still fit a reasonable token budget
-//!
-//! Donor: `feat/tail-command` `93ded41` (`src/tail.rs`), adapted for the
-//! `src/cmds/system/` layout, the `core::runner::run_filtered` helper, and
-//! the shared `core::utils::strip_ansi` regex.
 
 use crate::core::runner::{self, RunOptions};
-use crate::core::utils::{resolved_command, strip_ansi};
+use crate::core::utils::{exit_code_from_status, resolved_command, strip_ansi};
 use anyhow::Result;
 
 /// Threshold above which we collapse the middle of the output.
@@ -31,16 +27,75 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         eprintln!("Running: tail {}", args.join(" "));
     }
 
+    if is_follow_mode(args) {
+        let status = cmd.status()?;
+        return Ok(exit_code_from_status(&status, "tail"));
+    }
+
     // Tail reads from stdin when no file operands are supplied
     // (`cat foo.log | rtk tail -n 50`); forward our stdin so that works.
-    let reads_stdin = !args.iter().any(|a| !a.starts_with('-'));
-    let opts = if reads_stdin {
+    let opts = if reads_from_stdin(args) {
         RunOptions::stdout_only().inherit_stdin()
     } else {
         RunOptions::stdout_only()
     };
 
     runner::run_filtered(cmd, "tail", &args.join(" "), compact_tail, opts)
+}
+
+fn reads_from_stdin(args: &[String]) -> bool {
+    !has_file_operand(args)
+}
+
+fn has_file_operand(args: &[String]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--" {
+            return idx + 1 < args.len();
+        }
+        if takes_separate_value(arg) {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            idx += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn takes_separate_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-n" | "-c" | "--lines" | "--bytes" | "--pid" | "--sleep-interval" | "--max-unchanged-stats"
+    )
+}
+
+/// Returns true when `tail` is in follow mode (`-f`, `-F`, or `--follow`).
+///
+/// Follow mode is an ongoing stream. Capturing it for post-processing would
+/// wait forever before printing anything, so RTK runs it as raw passthrough.
+fn is_follow_mode(args: &[String]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--follow" || arg.starts_with("--follow=") {
+            return true;
+        }
+        if let Some(shorts) = arg.strip_prefix('-') {
+            if !shorts.is_empty()
+                && !shorts.starts_with('-')
+                && (shorts.contains('f') || shorts.contains('F'))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Compact `tail` output: strip ANSI, add line numbers, collapse if huge.
@@ -173,5 +228,56 @@ mod tests {
             !output.contains("line 150"),
             "middle should be collapsed, got:\n{output}"
         );
+    }
+
+    #[test]
+    fn follow_mode_detects_streaming_flags() {
+        for args in [
+            vec!["-f"],
+            vec!["-F"],
+            vec!["-n", "20", "-f", "app.log"],
+            vec!["-fn", "20", "app.log"],
+            vec!["--follow", "app.log"],
+            vec!["--follow=name", "app.log"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(is_follow_mode(&args), "{args:?} should stream raw");
+        }
+    }
+
+    #[test]
+    fn follow_mode_ignores_filenames_after_option_separator() {
+        let args = ["--", "-f"].into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert!(
+            !is_follow_mode(&args),
+            "{args:?} should treat -f as a file operand"
+        );
+    }
+
+    #[test]
+    fn stdin_mode_accounts_for_option_values() {
+        for args in [
+            vec![],
+            vec!["-n", "50"],
+            vec!["--lines", "20"],
+            vec!["-50"],
+            vec!["--lines=20"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(reads_from_stdin(&args), "{args:?} should inherit stdin");
+        }
+
+        for args in [
+            vec!["app.log"],
+            vec!["-n", "50", "app.log"],
+            vec!["--lines=20", "app.log"],
+            vec!["--", "-f"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                !reads_from_stdin(&args),
+                "{args:?} should use file operands"
+            );
+        }
     }
 }
