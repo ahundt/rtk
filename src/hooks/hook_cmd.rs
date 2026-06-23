@@ -2154,12 +2154,11 @@ mod tests {
         }
     }
 
-    // ── Gemini robustness tests (port from feat/gemini-support-v2) ────────
+    // ── Gemini robustness tests ─────────────────────────────────────────
     //
-    // These tests harden run_gemini against the failure modes documented in
-    // notes/v3-pr-meta.md → PR #158 (REVISED 2026-06-09): fail-open on bad
-    // JSON, BeforeTool event filtering, broader shell-tool matching including
-    // MCP patterns, and tool_input field preservation on rewrite.
+    // These tests cover fail-open malformed input, BeforeTool filtering,
+    // shell-tool matching including MCP patterns, and tool_input field
+    // preservation on rewrite.
 
     fn parse_gemini_output(output: &str) -> Value {
         serde_json::from_str(output).unwrap()
@@ -2307,6 +2306,7 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(b, c);
     }
+
     #[test]
     fn test_gemini_json_preserves_other_tool_input_fields() {
         // The original tool_input has timeout + cwd alongside command. After
