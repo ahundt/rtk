@@ -66,7 +66,7 @@ pub(crate) enum HookResponse {
 ///
 /// The `RTK_HOOK_ENABLED` check compares against the literal `"0"` so
 /// any other value (including `"1"` or empty) keeps hooks active —
-/// avoids accidental disable from a stale `=` line in `~/.zshrc`.
+/// avoids accidental disable from a stale shell startup-file assignment.
 pub(crate) fn is_hook_disabled() -> bool {
     std::env::var("RTK_HOOK_ENABLED").as_deref() == Ok("0") || is_rtk_active()
 }

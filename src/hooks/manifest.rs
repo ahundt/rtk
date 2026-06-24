@@ -35,7 +35,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use tempfile::NamedTempFile;
 
 /// Atomic write via tempfile + rename. Same semantics as
@@ -328,9 +328,11 @@ pub(crate) fn run_manifest_handlers(payload: &str) -> ManifestResult {
             continue;
         }
         for command in entry.commands() {
-            let mut child = match Command::new("sh")
-                .arg("-c")
-                .arg(command)
+            let Some((program, args)) = split_handler_command(command) else {
+                continue;
+            };
+            let mut child = match crate::core::utils::resolved_command(&program)
+                .args(&args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -373,6 +375,12 @@ pub(crate) fn run_manifest_handlers(payload: &str) -> ManifestResult {
         },
         None => ManifestResult::NoBlock,
     }
+}
+
+fn split_handler_command(command: &str) -> Option<(String, Vec<String>)> {
+    let tokens = crate::discover::lexer::shell_split(command);
+    let (program, args) = tokens.split_first()?;
+    Some((program.clone(), args.to_vec()))
 }
 
 // =========================================================================
