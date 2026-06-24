@@ -3,11 +3,17 @@
 //! Uses `writeln!(stdout, ...)` instead of `println!` — accidental stdout/stderr
 //! corrupts the JSON protocol (Claude Code bug #4669 silently disables the hook).
 
-use super::constants::PRE_TOOL_USE_KEY;
+use super::constants::{
+    CODEX_HOOK_COMMAND, CODEX_HOOK_RTK_FALLTHROUGH, CODEX_HOOK_RTK_MARKER, PRE_TOOL_USE_KEY,
+};
 use super::permissions::{self, PermissionVerdict};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::discover::registry::{has_heredoc, rewrite_command};
 
@@ -543,8 +549,324 @@ fn run_claude_inner(input: &str) -> Option<String> {
 // native prompt run by omitting `permissionDecision`; Codex cannot, so
 // `run_codex` only emits rewrites that RTK can explicitly allow and
 // emits `{}` (Codex's neutral no-opinion) for default/ask decisions.
-// Codex semantics permit multiple matching hooks to run concurrently —
-// unlike Claude #1515, there is no manifest fallthrough to engineer here.
+//
+// Codex launches matching PreToolUse command hooks concurrently. RTK's
+// installer moves displaced Bash handlers into the RTK entry so this command
+// can run them serially after computing the command Codex will execute. That
+// preserves policy hooks without letting them race against the raw command.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexFallthroughHandler {
+    command: String,
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexFallthroughResult {
+    block_reason: Option<String>,
+    additional_contexts: Vec<String>,
+    system_messages: Vec<String>,
+}
+
+impl CodexFallthroughResult {
+    fn is_empty(&self) -> bool {
+        self.block_reason.is_none()
+            && self.additional_contexts.is_empty()
+            && self.system_messages.is_empty()
+    }
+}
+
+fn codex_payload_with_command(v: &Value, command: &str) -> Option<String> {
+    let mut payload = v.clone();
+    payload
+        .pointer_mut("/tool_input/command")?
+        .as_str()
+        .map(|_| ())?;
+    *payload.pointer_mut("/tool_input/command")? = Value::String(command.to_string());
+    serde_json::to_string(&payload).ok()
+}
+
+fn codex_fallthrough_payload(original_input: &str, v: &Value, action: &PayloadAction) -> String {
+    match action {
+        PayloadAction::Rewrite { rewritten, .. } => {
+            codex_payload_with_command(v, rewritten).unwrap_or_else(|| original_input.to_string())
+        }
+        PayloadAction::Deny { .. } | PayloadAction::Skip { .. } | PayloadAction::Ignore => {
+            original_input.to_string()
+        }
+    }
+}
+
+fn codex_hooks_json_path() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+        .map(|dir| dir.join("hooks.json"))
+}
+
+fn codex_fallthrough_handlers_from_config() -> Vec<CodexFallthroughHandler> {
+    let Some(path) = codex_hooks_json_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&content) else {
+        return Vec::new();
+    };
+    codex_fallthrough_handlers_from_json(&root)
+}
+
+fn codex_fallthrough_handlers_from_json(root: &Value) -> Vec<CodexFallthroughHandler> {
+    root.pointer("/hooks/PreToolUse")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|entry| codex_entry_is_rtk(entry))
+        .filter_map(|entry| {
+            entry
+                .get(CODEX_HOOK_RTK_FALLTHROUGH)
+                .and_then(|v| v.as_array())
+        })
+        .flatten()
+        .flat_map(codex_handlers_from_entry)
+        .collect()
+}
+
+fn codex_entry_is_rtk(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get(CODEX_HOOK_RTK_MARKER) == Some(&Value::Bool(true))
+                    || hook
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|command| command.starts_with(CODEX_HOOK_COMMAND))
+            })
+        })
+}
+
+fn codex_handlers_from_entry(entry: &Value) -> Vec<CodexFallthroughHandler> {
+    let timeout_secs = entry
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(600)
+        .max(1);
+    entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| codex_hook_command_for_platform(hook).map(|command| (hook, command)))
+        .filter(|(_, command)| !command.trim().is_empty())
+        .filter(|(hook, _)| hook.get(CODEX_HOOK_RTK_MARKER) != Some(&Value::Bool(true)))
+        .map(|(hook, command)| CodexFallthroughHandler {
+            command: command.to_string(),
+            timeout_secs: hook
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(timeout_secs)
+                .max(1),
+        })
+        .collect()
+}
+
+fn codex_hook_command_for_platform(hook: &Value) -> Option<&str> {
+    #[cfg(windows)]
+    {
+        hook.get("commandWindows")
+            .and_then(|v| v.as_str())
+            .or_else(|| hook.get("command").and_then(|v| v.as_str()))
+    }
+
+    #[cfg(not(windows))]
+    {
+        hook.get("command").and_then(|v| v.as_str())
+    }
+}
+
+fn run_codex_fallthrough_handlers(payload: &str) -> CodexFallthroughResult {
+    let handlers = codex_fallthrough_handlers_from_config();
+    run_codex_fallthrough_handlers_for(payload, &handlers)
+}
+
+fn run_codex_fallthrough_handlers_for(
+    payload: &str,
+    handlers: &[CodexFallthroughHandler],
+) -> CodexFallthroughResult {
+    let mut result = CodexFallthroughResult::default();
+    for handler in handlers {
+        let child = run_codex_fallthrough_command(payload, handler);
+        merge_codex_fallthrough_result(&mut result, child);
+        if result.block_reason.is_some() {
+            break;
+        }
+    }
+    result
+}
+
+fn run_codex_fallthrough_command(
+    payload: &str,
+    handler: &CodexFallthroughHandler,
+) -> CodexFallthroughResult {
+    let mut command = default_hook_shell_command();
+    command.arg(&handler.command);
+    command
+        .env("RTK_ACTIVE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let Ok(mut child) = command.spawn() else {
+        return CodexFallthroughResult::default();
+    };
+
+    let write_ok = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(payload.as_bytes()).is_ok());
+
+    let deadline = Instant::now() + Duration::from_secs(handler.timeout_secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return CodexFallthroughResult::default();
+            }
+        }
+    }
+
+    let Ok(output) = child.wait_with_output() else {
+        return CodexFallthroughResult::default();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    codex_fallthrough_result_from_output(output.status.code(), &stdout, &stderr, write_ok)
+}
+
+fn default_hook_shell_command() -> Command {
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut command = Command::new(comspec);
+        command.arg("/C");
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut command = Command::new(shell);
+        command.arg("-lc");
+        command
+    }
+}
+
+fn codex_fallthrough_result_from_output(
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    stdin_written: bool,
+) -> CodexFallthroughResult {
+    let mut result = parse_codex_fallthrough_json(stdout);
+    if result.block_reason.is_none() && exit_code == Some(2) && stdin_written {
+        result.block_reason = trimmed_non_empty(stderr);
+    }
+    result
+}
+
+fn parse_codex_fallthrough_json(stdout: &str) -> CodexFallthroughResult {
+    let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return CodexFallthroughResult::default();
+    };
+    let hook = v.get("hookSpecificOutput");
+    CodexFallthroughResult {
+        block_reason: codex_block_reason(&v),
+        additional_contexts: hook
+            .and_then(|h| h.get("additionalContext"))
+            .and_then(|v| v.as_str())
+            .and_then(trimmed_non_empty)
+            .into_iter()
+            .collect(),
+        system_messages: v
+            .get("systemMessage")
+            .and_then(|v| v.as_str())
+            .and_then(trimmed_non_empty)
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn codex_block_reason(v: &Value) -> Option<String> {
+    v.get("hookSpecificOutput")
+        .and_then(|hook| {
+            (hook.get("permissionDecision").and_then(|v| v.as_str()) == Some("deny"))
+                .then(|| {
+                    hook.get("permissionDecisionReason")
+                        .and_then(|v| v.as_str())
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            (v.get("decision").and_then(|v| v.as_str()) == Some("block"))
+                .then(|| v.get("reason").and_then(|v| v.as_str()))
+                .flatten()
+        })
+        .and_then(trimmed_non_empty)
+}
+
+fn trimmed_non_empty(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn merge_codex_fallthrough_result(into: &mut CodexFallthroughResult, from: CodexFallthroughResult) {
+    if into.block_reason.is_none() {
+        into.block_reason = from.block_reason;
+    }
+    into.additional_contexts.extend(from.additional_contexts);
+    into.system_messages.extend(from.system_messages);
+}
+
+fn merge_codex_hook_output(
+    output: Option<Value>,
+    fallthrough: CodexFallthroughResult,
+) -> Option<Value> {
+    if let Some(reason) = fallthrough.block_reason {
+        return Some(pre_tool_use_deny_output(&reason));
+    }
+
+    if fallthrough.is_empty() {
+        return output;
+    }
+
+    let mut output = output.unwrap_or_else(|| json!({}));
+    if let Some(message) = join_hook_text(fallthrough.system_messages) {
+        output["systemMessage"] = json!(message);
+    }
+    if let Some(context) = join_hook_text(fallthrough.additional_contexts) {
+        let hook = output
+            .as_object_mut()
+            .expect("hook output must be an object")
+            .entry("hookSpecificOutput")
+            .or_insert_with(|| json!({ "hookEventName": PRE_TOOL_USE_KEY }));
+        hook["hookEventName"] = json!(PRE_TOOL_USE_KEY);
+        hook["additionalContext"] = json!(context);
+    }
+    Some(output)
+}
+
+fn join_hook_text(chunks: Vec<String>) -> Option<String> {
+    (!chunks.is_empty()).then(|| chunks.join("\n\n"))
+}
 
 /// Run the Codex CLI PreToolUse hook natively.
 pub fn run_codex() -> Result<()> {
@@ -573,28 +895,37 @@ pub fn run_codex() -> Result<()> {
         return Ok(());
     }
 
-    match process_codex_payload(&v) {
+    if std::env::var_os("RTK_ACTIVE").is_some() {
+        let _ = writeln!(io::stdout(), "{{}}");
+        return Ok(());
+    }
+
+    let action = process_codex_payload(&v);
+    let fallthrough_payload = codex_fallthrough_payload(input, &v, &action);
+    let fallthrough = run_codex_fallthrough_handlers(&fallthrough_payload);
+
+    let output = match action {
         PayloadAction::Rewrite {
             cmd,
             rewritten,
             output,
         } => {
             audit_log("rewrite", &cmd, &rewritten);
-            let _ = writeln!(io::stdout(), "{output}");
+            Some(output)
         }
         PayloadAction::Skip { reason, cmd } => {
             audit_log(reason, &cmd, "");
-            let _ = writeln!(io::stdout(), "{{}}");
+            None
         }
         PayloadAction::Deny { cmd, reason } => {
             audit_log("deny", &cmd, &reason);
-            let output = pre_tool_use_deny_output(&reason);
-            let _ = writeln!(io::stdout(), "{output}");
+            Some(pre_tool_use_deny_output(&reason))
         }
-        PayloadAction::Ignore => {
-            let _ = writeln!(io::stdout(), "{{}}");
-        }
-    }
+        PayloadAction::Ignore => None,
+    };
+
+    let output = merge_codex_hook_output(output, fallthrough).unwrap_or_else(|| json!({}));
+    let _ = writeln!(io::stdout(), "{output}");
 
     Ok(())
 }
@@ -1316,6 +1647,96 @@ mod tests {
             "Blocked by RTK permission rule"
         );
         assert!(hook.get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn test_codex_fallthrough_payload_uses_rewritten_command() {
+        let input = codex_input("git status");
+        let v: Value = serde_json::from_str(&input).unwrap();
+        let action = process_codex_payload_with_decision(
+            &v,
+            "git status",
+            HookDecision::AllowRewrite("rtk git status".to_string()),
+        );
+
+        let fallthrough: Value =
+            serde_json::from_str(&codex_fallthrough_payload(&input, &v, &action)).unwrap();
+        assert_eq!(
+            fallthrough["tool_input"]["command"], "rtk git status",
+            "displaced policy hooks must inspect the command Codex will execute"
+        );
+    }
+
+    #[test]
+    fn test_codex_fallthrough_handlers_are_read_from_rtk_entry() {
+        let root = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "^Bash$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "rtk hook codex",
+                        CODEX_HOOK_RTK_MARKER: true
+                    }],
+                    CODEX_HOOK_RTK_FALLTHROUGH: [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/usr/local/bin/policy-hook",
+                            "timeout": 7
+                        }]
+                    }]
+                }]
+            }
+        });
+
+        assert_eq!(
+            codex_fallthrough_handlers_from_json(&root),
+            vec![CodexFallthroughHandler {
+                command: "/usr/local/bin/policy-hook".to_string(),
+                timeout_secs: 7
+            }]
+        );
+    }
+
+    #[test]
+    fn test_codex_fallthrough_deny_overrides_rtk_rewrite() {
+        let base = run_codex_allowed_json(&codex_input("git status")).unwrap();
+        let child = codex_fallthrough_result_from_output(
+            Some(0),
+            &json!({
+                "hookSpecificOutput": {
+                    "hookEventName": PRE_TOOL_USE_KEY,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "Use rg instead"
+                }
+            })
+            .to_string(),
+            "",
+            true,
+        );
+
+        let merged = merge_codex_hook_output(Some(base), child).unwrap();
+        let hook = &merged["hookSpecificOutput"];
+        assert_eq!(hook["permissionDecision"], "deny");
+        assert_eq!(hook["permissionDecisionReason"], "Use rg instead");
+        assert!(hook.get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn test_codex_fallthrough_additional_context_merges_with_rewrite() {
+        let base = run_codex_allowed_json(&codex_input("git status")).unwrap();
+        let child = CodexFallthroughResult {
+            additional_contexts: vec!["Remember repo policy".to_string()],
+            system_messages: vec!["Policy hook ran".to_string()],
+            ..Default::default()
+        };
+
+        let merged = merge_codex_hook_output(Some(base), child).unwrap();
+        let hook = &merged["hookSpecificOutput"];
+        assert_eq!(hook["permissionDecision"], "allow");
+        assert_eq!(hook["updatedInput"]["command"], "rtk git status");
+        assert_eq!(hook["additionalContext"], "Remember repo policy");
+        assert_eq!(merged["systemMessage"], "Policy hook ran");
     }
 
     #[test]

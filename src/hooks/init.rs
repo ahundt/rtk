@@ -14,11 +14,11 @@ use crate::hooks::constants::{
 
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CODEX_HOOKS_JSON,
-    CODEX_HOOK_COMMAND, CODEX_HOOK_RTK_MARKER, CURSOR_HOOK_COMMAND, GEMINI_HOOK_FILE, HERMES_DIR,
-    HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE,
-    HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR,
-    PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
-    SETTINGS_JSON,
+    CODEX_HOOK_COMMAND, CODEX_HOOK_RTK_FALLTHROUGH, CODEX_HOOK_RTK_MARKER, CODEX_HOOK_RTK_RESIDUAL,
+    CURSOR_HOOK_COMMAND, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
+    HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
+    HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR,
+    PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 
@@ -2440,13 +2440,13 @@ fn run_codex_mode_with_paths(
 // tables in `config.toml`); RTK chooses hooks.json to avoid mutating
 // the user's config.toml at all.
 //
-// Codex semantics (developers.openai.com/codex/hooks): "Multiple
-// matching command hooks for the same event are launched concurrently,
-// so one hook cannot prevent another matching hook from starting." So
-// unlike Claude #1515, there is NO collision to engineer around — we
-// append our hook alongside any existing entries and Codex runs them
-// all. Foreign entries (user-managed or other tools) are preserved
-// verbatim.
+// Codex launches multiple matching PreToolUse command hooks concurrently.
+// That means appending RTK beside an existing Bash policy hook is not
+// sufficient: the other hook still sees the raw command and may block before
+// RTK's `updatedInput` can take effect. RTK therefore becomes the sole
+// top-level Bash matcher and records displaced Bash handlers in a private
+// fallthrough field. Non-Bash behavior is preserved with marked residual
+// matcher groups where the matcher can be narrowed safely.
 //
 // Each entry RTK owns carries a `_rtk_managed: true` marker that lets
 // uninstall find them even if the user later edits the command path
@@ -2537,6 +2537,7 @@ fn upsert_codex_hook_json(
             value_kind(&root)
         );
     }
+    let original_root = root.clone();
 
     // Ensure root.hooks.PreToolUse is an array.
     let hooks_obj = root
@@ -2564,55 +2565,39 @@ fn upsert_codex_hook_json(
     }
     let pre_arr = pre_arr.as_array_mut().expect("checked above");
 
-    // The canonical RTK entry we want present. matcher="^Bash$" is the
-    // Codex PreToolUse matcher syntax (anchored regex). statusMessage is
-    // a tiny user-facing breadcrumb Codex surfaces while the hook runs.
-    let rtk_entry = json!({
-        "matcher": "^Bash$",
-        "hooks": [{
-            "type": "command",
-            "command": rtk_command,
-            "timeout": 30,
-            "statusMessage": "RTK rewriting Bash command",
-            CODEX_HOOK_RTK_MARKER: true
-        }]
-    });
+    let had_rtk_entry = pre_arr
+        .iter()
+        .any(|entry| is_codex_rtk_entry(entry, rtk_command));
+    let old_entries = std::mem::take(pre_arr);
+    let mut retained = Vec::with_capacity(old_entries.len() + 1);
+    let mut fallthrough = Vec::new();
 
-    // Look for an existing RTK-managed entry, identified by either:
-    //   (a) any sub-hook carrying the `_rtk_managed: true` marker, or
-    //   (b) any sub-hook whose `command` starts with `rtk hook codex`.
-    // (a) is the durable marker; (b) catches pre-marker installs and
-    // hand-written entries. Either way we keep at most ONE RTK entry.
-    let mut rtk_index: Option<usize> = None;
-    for (i, entry) in pre_arr.iter().enumerate() {
-        let sub = entry.pointer("/hooks").and_then(|v| v.as_array());
-        if let Some(hooks) = sub {
-            let owned = hooks.iter().any(|h| {
-                h.get(CODEX_HOOK_RTK_MARKER) == Some(&Value::Bool(true))
-                    || h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.starts_with(rtk_command))
-            });
-            if owned {
-                rtk_index = Some(i);
-                break;
-            }
+    for entry in old_entries {
+        if is_codex_rtk_entry(&entry, rtk_command) {
+            extend_codex_fallthrough(&mut fallthrough, &entry);
+            continue;
         }
+
+        if codex_entry_matches_bash(&entry) {
+            push_unique_value(&mut fallthrough, entry.clone());
+            if let Some(residual) = codex_non_bash_residual(entry)? {
+                retained.push(residual);
+            }
+            continue;
+        }
+
+        retained.push(entry);
     }
 
-    let action = match rtk_index {
-        Some(i) => {
-            if pre_arr[i] == rtk_entry {
-                CodexHookUpsert::Unchanged
-            } else {
-                pre_arr[i] = rtk_entry;
-                CodexHookUpsert::Updated
-            }
-        }
-        None => {
-            pre_arr.push(rtk_entry);
-            CodexHookUpsert::Added
-        }
+    retained.push(codex_rtk_entry(rtk_command, fallthrough));
+    *pre_arr = retained;
+
+    let action = if root == original_root {
+        CodexHookUpsert::Unchanged
+    } else if had_rtk_entry {
+        CodexHookUpsert::Updated
+    } else {
+        CodexHookUpsert::Added
     };
 
     let rendered = if matches!(action, CodexHookUpsert::Unchanged) {
@@ -2625,6 +2610,129 @@ fn upsert_codex_hook_json(
     };
 
     Ok((rendered, action))
+}
+
+fn codex_rtk_entry(rtk_command: &str, fallthrough: Vec<serde_json::Value>) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut entry = json!({
+        "matcher": "^Bash$",
+        "hooks": [{
+            "type": "command",
+            "command": rtk_command,
+            "timeout": 30,
+            "statusMessage": "RTK rewriting Bash command",
+            CODEX_HOOK_RTK_MARKER: true
+        }]
+    });
+    if !fallthrough.is_empty() {
+        entry
+            .as_object_mut()
+            .expect("rtk entry is an object")
+            .insert(
+                CODEX_HOOK_RTK_FALLTHROUGH.to_string(),
+                serde_json::Value::Array(fallthrough),
+            );
+    }
+    entry
+}
+
+fn is_codex_rtk_entry(entry: &serde_json::Value, rtk_command: &str) -> bool {
+    entry
+        .pointer("/hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|hook| {
+                hook.get(CODEX_HOOK_RTK_MARKER) == Some(&serde_json::Value::Bool(true))
+                    || hook
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.starts_with(rtk_command))
+            })
+        })
+}
+
+fn extend_codex_fallthrough(fallthrough: &mut Vec<serde_json::Value>, entry: &serde_json::Value) {
+    if let Some(entries) = entry
+        .get(CODEX_HOOK_RTK_FALLTHROUGH)
+        .and_then(|v| v.as_array())
+    {
+        for item in entries {
+            push_unique_value(fallthrough, item.clone());
+        }
+    }
+}
+
+fn push_unique_value(values: &mut Vec<serde_json::Value>, value: serde_json::Value) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn codex_entry_matches_bash(entry: &serde_json::Value) -> bool {
+    codex_matcher_matches_bash(entry.get("matcher").and_then(|m| m.as_str()))
+}
+
+fn codex_matcher_matches_bash(matcher: Option<&str>) -> bool {
+    match matcher {
+        None => true,
+        Some(matcher) if matcher.is_empty() || matcher == "*" => true,
+        Some(matcher) if is_codex_exact_matcher(matcher) => {
+            matcher.split('|').any(|candidate| candidate == "Bash")
+        }
+        Some(matcher) => regex::Regex::new(matcher)
+            .map(|regex| regex.is_match("Bash"))
+            .unwrap_or(false),
+    }
+}
+
+fn codex_non_bash_residual(mut entry: serde_json::Value) -> Result<Option<serde_json::Value>> {
+    let matcher = entry.get("matcher").and_then(|m| m.as_str());
+    let replacement = match matcher {
+        None | Some("") | Some("*") => Some(codex_non_bash_matcher().to_string()),
+        Some(matcher) if is_codex_exact_matcher(matcher) => {
+            let kept = matcher
+                .split('|')
+                .filter(|candidate| *candidate != "Bash")
+                .collect::<Vec<_>>();
+            (!kept.is_empty()).then(|| kept.join("|"))
+        }
+        Some("^Bash$") => None,
+        Some(matcher) => {
+            anyhow::bail!(
+                "Codex PreToolUse matcher {:?} matches Bash but cannot be split losslessly. \
+                 Replace it with an exact matcher such as Bash|Edit or ^Bash$ before installing RTK.",
+                matcher
+            );
+        }
+    };
+
+    let Some(replacement) = replacement else {
+        return Ok(None);
+    };
+
+    let Some(obj) = entry.as_object_mut() else {
+        return Ok(None);
+    };
+    obj.insert(
+        "matcher".to_string(),
+        serde_json::Value::String(replacement),
+    );
+    obj.insert(
+        CODEX_HOOK_RTK_RESIDUAL.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    Ok(Some(entry))
+}
+
+fn codex_non_bash_matcher() -> &'static str {
+    r"^(?:[^B].*|B(?:$|[^a].*)|Ba(?:$|[^s].*)|Bas(?:$|[^h].*)|Bash.+)$"
+}
+
+fn is_codex_exact_matcher(matcher: &str) -> bool {
+    matcher
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|')
 }
 
 fn value_kind(v: &serde_json::Value) -> &'static str {
@@ -2659,26 +2767,25 @@ fn remove_codex_hook_from_json(existing: &str, rtk_command: &str) -> Result<Opti
         return Ok(None);
     };
 
+    let old_entries = std::mem::take(pre_arr);
+    let mut restored = Vec::new();
     let mut changed = false;
-    let before_len = pre_arr.len();
-    pre_arr.retain(|entry| {
-        let owned = entry
-            .pointer("/hooks")
-            .and_then(|v| v.as_array())
-            .is_some_and(|hs| {
-                hs.iter().any(|h| {
-                    h.get(CODEX_HOOK_RTK_MARKER) == Some(&Value::Bool(true))
-                        || h.get("command")
-                            .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.starts_with(rtk_command))
-                })
-            });
-        if owned {
+
+    for entry in old_entries {
+        if is_codex_rtk_entry(&entry, rtk_command) {
+            extend_codex_fallthrough(&mut restored, &entry);
             changed = true;
+        } else if entry.get(CODEX_HOOK_RTK_RESIDUAL) == Some(&Value::Bool(true)) {
+            changed = true;
+        } else {
+            pre_arr.push(entry);
         }
-        !owned
-    });
-    if !changed && pre_arr.len() == before_len {
+    }
+    for entry in restored {
+        pre_arr.push(entry);
+    }
+
+    if !changed {
         return Ok(None);
     }
 
@@ -5622,6 +5729,12 @@ mod tests {
         entries[index]["hooks"][0]["command"].as_str().unwrap()
     }
 
+    fn codex_fallthrough(entries: &[serde_json::Value], index: usize) -> &[serde_json::Value] {
+        entries[index][CODEX_HOOK_RTK_FALLTHROUGH]
+            .as_array()
+            .unwrap()
+    }
+
     #[test]
     fn test_codex_upsert_adds_to_empty_file() {
         let (out, action) = upsert_codex_hook_json(None, CODEX_HOOK_COMMAND).unwrap();
@@ -5646,13 +5759,10 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_upsert_preserves_foreign_entries() {
-        // User's pre-existing hooks.json with an unrelated PreToolUse entry
-        // (e.g. an audit logger) must survive the install untouched.
+    fn test_codex_upsert_moves_bash_entries_to_rtk_fallthrough() {
         let existing = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "^Bash$",
                     "hooks": [{
                         "type": "command",
                         "command": "/usr/local/bin/my-audit-logger",
@@ -5669,14 +5779,113 @@ mod tests {
         assert_eq!(
             entries.len(),
             2,
-            "foreign entry must remain alongside rtk entry"
+            "match-all foreign entry must be split into non-Bash residual plus RTK Bash entry"
         );
-        // Foreign first, rtk appended.
         assert_eq!(
             codex_hook_command(entries, 0),
             "/usr/local/bin/my-audit-logger"
         );
+        assert_eq!(entries[0]["matcher"], codex_non_bash_matcher());
+        assert_eq!(entries[0][CODEX_HOOK_RTK_RESIDUAL], true);
         assert_eq!(codex_hook_command(entries, 1), CODEX_HOOK_COMMAND);
+        let fallthrough = codex_fallthrough(entries, 1);
+        assert_eq!(fallthrough.len(), 1);
+        assert_eq!(
+            fallthrough[0]["hooks"][0]["command"],
+            "/usr/local/bin/my-audit-logger"
+        );
+        assert!(
+            fallthrough[0].get("matcher").is_none(),
+            "fallthrough must keep the original match-all group"
+        );
+    }
+
+    #[test]
+    fn test_codex_upsert_preserves_non_bash_entries() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit|Write",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/my-editor-hook"
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        let (out, action) = upsert_codex_hook_json(Some(&existing), CODEX_HOOK_COMMAND).unwrap();
+        assert_eq!(action, CodexHookUpsert::Added);
+        let v = parse_codex_hooks_json(&out);
+        let entries = codex_pre_tool_use_entries(&v);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matcher"], "Edit|Write");
+        assert_eq!(
+            codex_hook_command(entries, 0),
+            "/usr/local/bin/my-editor-hook"
+        );
+        assert_eq!(codex_hook_command(entries, 1), CODEX_HOOK_COMMAND);
+        assert!(entries[1].get(CODEX_HOOK_RTK_FALLTHROUGH).is_none());
+    }
+
+    #[test]
+    fn test_codex_upsert_splits_exact_alternation_matcher() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash|Edit|Write",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/policy-hook"
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        let (out, action) = upsert_codex_hook_json(Some(&existing), CODEX_HOOK_COMMAND).unwrap();
+        assert_eq!(action, CodexHookUpsert::Added);
+        let v = parse_codex_hooks_json(&out);
+        let entries = codex_pre_tool_use_entries(&v);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["matcher"], "Edit|Write");
+        assert_eq!(entries[0][CODEX_HOOK_RTK_RESIDUAL], true);
+        assert_eq!(
+            codex_fallthrough(entries, 1)[0]["matcher"],
+            "Bash|Edit|Write"
+        );
+    }
+
+    #[test]
+    fn test_codex_upsert_refuses_unsplittable_regex_matcher() {
+        let existing = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "^(Bash|Edit)$",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "/usr/local/bin/policy-hook"
+                    }]
+                }]
+            }
+        })
+        .to_string();
+
+        let err = upsert_codex_hook_json(Some(&existing), CODEX_HOOK_COMMAND)
+            .expect_err("lossy matcher split must be rejected");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("cannot be split losslessly"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_codex_non_bash_matcher_excludes_only_bash() {
+        let regex = regex::Regex::new(codex_non_bash_matcher()).unwrap();
+        for tool in ["B", "Ba", "Bas", "Bashful", "Edit", "Write"] {
+            assert!(regex.is_match(tool), "{tool} should be retained");
+        }
+        assert!(!regex.is_match("Bash"));
     }
 
     #[test]
@@ -5796,6 +6005,51 @@ mod tests {
             codex_hook_command(entries, 0),
             "/usr/local/bin/my-audit-logger"
         );
+    }
+
+    #[test]
+    fn test_codex_remove_restores_fallthrough_and_drops_residual() {
+        let original = serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": "/usr/local/bin/my-audit-logger",
+                "timeout": 5
+            }]
+        });
+        let mixed = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": codex_non_bash_matcher(),
+                        "hooks": original["hooks"].clone(),
+                        CODEX_HOOK_RTK_RESIDUAL: true
+                    },
+                    {
+                        "matcher": "^Bash$",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "rtk hook codex",
+                            CODEX_HOOK_RTK_MARKER: true
+                        }],
+                        CODEX_HOOK_RTK_FALLTHROUGH: [original]
+                    }
+                ]
+            }
+        })
+        .to_string();
+
+        let result = remove_codex_hook_from_json(&mixed, CODEX_HOOK_COMMAND)
+            .unwrap()
+            .expect("rtk entry should have been removed");
+        let v = parse_codex_hooks_json(&result);
+        let entries = codex_pre_tool_use_entries(&v);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].get("matcher").is_none());
+        assert_eq!(
+            codex_hook_command(entries, 0),
+            "/usr/local/bin/my-audit-logger"
+        );
+        assert!(entries[0].get(CODEX_HOOK_RTK_RESIDUAL).is_none());
     }
 
     #[test]
