@@ -23,6 +23,11 @@ pub const CODEX_HOOKS_JSON: &str = "hooks.json";
 /// path (e.g. moved the rtk binary). Underscore-prefix prevents clash
 /// with reserved Codex schema field names.
 pub const CODEX_HOOK_RTK_MARKER: &str = "_rtk_managed";
+/// RTK-owned matcher-group field holding Bash handlers displaced from
+/// top-level Codex PreToolUse execution.
+pub const CODEX_HOOK_RTK_FALLTHROUGH: &str = "_rtk_fallthrough";
+/// Marker for non-Bash residual copies of displaced Codex matcher groups.
+pub const CODEX_HOOK_RTK_RESIDUAL: &str = "_rtk_residual";
 
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";
