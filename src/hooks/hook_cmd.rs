@@ -971,10 +971,9 @@ fn run_codex_fallthrough_command(
         return CodexFallthroughResult::default();
     };
 
-    let write_ok = child
-        .stdin
-        .take()
-        .is_some_and(|mut stdin| stdin.write_all(payload.as_bytes()).is_ok());
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
 
     let deadline = Instant::now() + Duration::from_secs(handler.timeout_secs);
     loop {
@@ -996,7 +995,7 @@ fn run_codex_fallthrough_command(
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    codex_fallthrough_result_from_output(output.status.code(), &stdout, &stderr, write_ok)
+    codex_fallthrough_result_from_output(output.status.code(), &stdout, &stderr)
 }
 
 fn default_hook_shell_command() -> Command {
@@ -1021,10 +1020,9 @@ fn codex_fallthrough_result_from_output(
     exit_code: Option<i32>,
     stdout: &str,
     stderr: &str,
-    stdin_written: bool,
 ) -> CodexFallthroughResult {
     let mut result = parse_codex_fallthrough_json(stdout);
-    if result.block_reason.is_none() && exit_code == Some(2) && stdin_written {
+    if result.block_reason.is_none() && exit_code == Some(2) {
         result.block_reason = trimmed_non_empty(stderr);
     }
     result
@@ -2056,7 +2054,6 @@ mod tests {
             })
             .to_string(),
             "",
-            true,
         );
 
         let merged = merge_codex_hook_output(Some(base), child).unwrap();
@@ -2064,6 +2061,16 @@ mod tests {
         assert_eq!(hook["permissionDecision"], "deny");
         assert_eq!(hook["permissionDecisionReason"], "Use rg instead");
         assert!(hook.get("updatedInput").is_none());
+    }
+
+    #[test]
+    fn test_codex_fallthrough_exit_two_stderr_blocks_even_after_early_exit() {
+        let child = codex_fallthrough_result_from_output(Some(2), "", "manual approval required\n");
+        assert_eq!(
+            child.block_reason.as_deref(),
+            Some("manual approval required"),
+            "Codex blocks PreToolUse hooks on exit code 2 plus stderr even if the hook exits before reading stdin"
+        );
     }
 
     #[test]
