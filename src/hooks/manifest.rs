@@ -10,9 +10,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 const MANIFEST_FILE: &str = "rtk-bash-manifest.json";
@@ -108,25 +112,62 @@ fn wait_for_output(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<Option<std::process::Output>> {
+    let stdout = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
     let deadline = Instant::now() + timeout;
     loop {
-        if child
-            .try_wait()
-            .context("Failed to poll plugin hook")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .map(Some)
-                .context("Failed to capture plugin hook output");
+        if let Some(status) = child.try_wait().context("Failed to poll plugin hook")? {
+            let stdout = join_pipe(stdout).context("Failed to capture plugin hook stdout")?;
+            let stderr = join_pipe(stderr).context("Failed to capture plugin hook stderr")?;
+            return Ok(Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            // A timed-out hook may have left descendants holding the pipes open. Dropping
+            // these handles avoids waiting for those descendants while their readers finish
+            // naturally when the inherited descriptors close.
             return Ok(None);
         }
         std::thread::sleep(HOOK_POLL_INTERVAL);
     }
+}
+
+fn join_pipe(pipe: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>) -> Result<Vec<u8>> {
+    pipe.map(|pipe| {
+        pipe.join()
+            .map_err(|_| anyhow::anyhow!("plugin hook output reader panicked"))?
+            .context("failed to read plugin hook output")
+    })
+    .transpose()
+    .map(|output| output.unwrap_or_default())
+}
+
+fn write_stdin_in_background(child: &mut std::process::Child, payload: &str) -> Arc<AtomicBool> {
+    let write_ok = Arc::new(AtomicBool::new(false));
+    let Some(mut stdin) = child.stdin.take() else {
+        return write_ok;
+    };
+    let payload = payload.as_bytes().to_owned();
+    let completed = Arc::clone(&write_ok);
+    std::thread::spawn(move || {
+        completed.store(stdin.write_all(&payload).is_ok(), Ordering::Release);
+    });
+    write_ok
 }
 
 pub(crate) fn run_manifest_handlers(claude_dir: &Path, payload: &str) -> ManifestResult {
@@ -171,17 +212,14 @@ pub(crate) fn run_manifest_handlers(claude_dir: &Path, payload: &str) -> Manifes
                 Err(_) => continue,
             };
 
-            let write_ok = child
-                .stdin
-                .take()
-                .map(|mut stdin| stdin.write_all(payload.as_bytes()).is_ok())
-                .unwrap_or(false);
+            let write_ok = write_stdin_in_background(&mut child, payload);
             let Ok(Some(output)) = wait_for_output(child, CLAUDE_DEFAULT_HOOK_TIMEOUT) else {
                 continue;
             };
 
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let blocked = (output.status.code() == Some(2) && write_ok) || is_json_deny(&stdout);
+            let blocked = (output.status.code() == Some(2) && write_ok.load(Ordering::Acquire))
+                || is_json_deny(&stdout);
             if blocked && first_block.is_none() {
                 first_block = Some(stdout.into_owned());
                 stderr.extend_from_slice(&output.stderr);
@@ -808,6 +846,44 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_reading_handler_cannot_block_before_timeout() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        write_stdin_in_background(&mut child, &"x".repeat(1_048_576));
+        assert!(wait_for_output(child, Duration::from_millis(25))
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_handler_with_large_output_is_not_killed_for_pipe_backpressure() {
+        let child = Command::new("sh")
+            .args(["-c", "yes x | head -n 100000"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+
+        let output = wait_for_output(child, Duration::from_secs(2))
+            .unwrap()
+            .expect("large output must be drained while the child runs");
+        assert!(output.stdout.len() > 100_000);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
