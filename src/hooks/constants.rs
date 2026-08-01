@@ -7,6 +7,8 @@ pub const SETTINGS_LOCAL_JSON: &str = "settings.local.json";
 pub const HOOKS_JSON: &str = "hooks.json";
 pub const PRE_TOOL_USE_KEY: &str = "PreToolUse";
 pub const BEFORE_TOOL_KEY: &str = "BeforeTool";
+/// Regex for Gemini's built-in and MCP shell tool names.
+pub const GEMINI_SHELL_TOOL_MATCHER: &str = r"^(run_shell_command|shell|mcp_.+_run_shell_command)$";
 
 /// Native Rust hook command for Claude Code (replaces rtk-rewrite.sh).
 pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";

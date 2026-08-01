@@ -139,10 +139,16 @@ Returns `{}` when no rewrite (Cursor requires JSON for all paths).
 
 ```json
 {
+  "hook_event_name": "BeforeTool",
   "tool_name": "run_shell_command",
   "tool_input": { "command": "git status" }
 }
 ```
+
+The installed matcher covers `run_shell_command`, the legacy `shell` alias,
+and MCP names ending in `_run_shell_command`. Payloads without
+`hook_event_name` remain supported for compatibility; explicit non-`BeforeTool`
+events are passed through.
 
 **Output** (when rewritten):
 
@@ -155,7 +161,9 @@ Returns `{}` when no rewrite (Cursor requires JSON for all paths).
 }
 ```
 
-**No rewrite**: `{"decision": "allow"}`
+**No rewrite**: `{"decision": "allow"}`. Gemini does not expose an `ask`
+decision, so RTK leaves commands that require confirmation unchanged and lets
+Gemini apply its normal permission flow.
 
 ### OpenCode (TypeScript Plugin)
 
