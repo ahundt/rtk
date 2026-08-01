@@ -21,11 +21,11 @@ When a hook sends `cargo fmt --all && cargo test 2>&1 | tail -20`:
 → [Arg("cargo"), Arg("test"), Redirect("2>&1"), Operator("&&"), Arg("git"), Arg("status")]
 ```
 
-**Compound splitting** — The rewrite engine walks the tokens, splitting on `Operator` (`&&`, `||`, `;`) and typed `Pipe` tokens (`|`, `|&`). For normal pipelines, producers and intermediate stages stay raw, and only an argument-safe final stage marked `pipeline_final_safe` is rewritten. The initial safe set is ordinary `grep` and `rg` invocations; search pattern-file forms (`-f`/`--file`) defer because they can consume pipeline stdin as configuration. Stderr pipelines (`|&`) and pipelines containing opaque shell groups remain raw.
+**Compound splitting** — The rewrite engine walks the tokens, splitting on `Operator` (`&&`, `||`, `;`) and typed `Pipe` tokens (`|`, `|&`). Producers and content-sensitive consumers such as `grep`, `rg`, `tee`, and `xargs` remain byte-for-byte raw. A plain `head`, `tail`, or `cat` tail is accepted only when its arguments read stdin, so safe display-tail commands can retain the producer rewrite without changing output meaning. Stderr pipelines (`|&`) and pipelines containing opaque shell groups remain raw.
 
 **Per-segment rewriting** — Each segment goes through:
 
-1. Strip trailing redirects (`2>&1`, `>/dev/null`) — matched via lexer tokens, set aside, re-appended after rewriting
+1. Split trailing output routing (`2>&1`, `>/dev/null`) with lexer tokens — preserve the original bytes and mark real file targets ask-only
 2. Short-circuit special cases — `head -20 file` → `rtk read file --max-lines 20`, `tail -n 5 file` → `rtk read file --tail-lines 5`. These can't go through generic prefix replacement because it would produce `rtk read -20 file` (wrong flag position)
 3. Classify the command — strip env prefixes (`sudo`, `FOO="bar baz"`), normalize paths (`/usr/bin/grep` → `grep`), strip git global opts (`git -C /tmp` → `git`), then match against 60+ regex patterns from `rules.rs`
 4. Apply the rewrite — find the matching rule, replace the command prefix with `rtk <cmd>`, re-prepend the env prefix, re-append the redirect suffix
