@@ -26,6 +26,10 @@ pub fn tokenize(input: &str) -> Vec<ParsedToken> {
     tokenize_inner(input, false)
 }
 
+pub(super) fn tokenize_with_newlines(input: &str) -> Vec<ParsedToken> {
+    tokenize_inner(input, true)
+}
+
 fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -34,15 +38,46 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
     let mut chars = input.chars().peekable();
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut in_comment = false;
+    let mut at_word_start = true;
 
     while let Some(c) = chars.next() {
         let char_len = c.len_utf8();
+
+        if in_comment {
+            if matches!(c, '\n' | '\r') {
+                in_comment = false;
+                if emit_newline {
+                    let start = byte_pos;
+                    let mut value = c.to_string();
+                    byte_pos += char_len;
+                    if c == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                        value.push('\n');
+                        byte_pos += 1;
+                    }
+                    tokens.push(ParsedToken {
+                        kind: TokenKind::Operator,
+                        value,
+                        offset: start,
+                    });
+                } else {
+                    byte_pos += char_len;
+                }
+                current_start = byte_pos;
+                at_word_start = true;
+                continue;
+            }
+            byte_pos += char_len;
+            continue;
+        }
 
         if escaped {
             current.push('\\');
             current.push(c);
             byte_pos += char_len;
             escaped = false;
+            at_word_start = false;
             continue;
         }
         if c == '\\' && quote != Some('\'') {
@@ -69,10 +104,16 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
             }
             current.push(c);
             byte_pos += char_len;
+            at_word_start = false;
             continue;
         }
 
         match c {
+            '#' if at_word_start => {
+                in_comment = true;
+                byte_pos += char_len;
+                current_start = byte_pos;
+            }
             '$' => {
                 flush_arg(&mut tokens, &mut current, current_start);
                 let start = byte_pos;
@@ -103,6 +144,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                     });
                 }
                 current_start = byte_pos;
+                at_word_start = false;
             }
             '*' | '?' | '`' | '(' | ')' | '{' | '}' | '!' => {
                 flush_arg(&mut tokens, &mut current, current_start);
@@ -113,6 +155,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 });
                 byte_pos += char_len;
                 current_start = byte_pos;
+                at_word_start = false;
             }
             '|' => {
                 flush_arg(&mut tokens, &mut current, current_start);
@@ -142,6 +185,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                     });
                 }
                 current_start = byte_pos;
+                at_word_start = true;
             }
             ';' => {
                 flush_arg(&mut tokens, &mut current, current_start);
@@ -152,6 +196,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 });
                 byte_pos += char_len;
                 current_start = byte_pos;
+                at_word_start = true;
             }
             '&' => {
                 flush_arg(&mut tokens, &mut current, current_start);
@@ -187,6 +232,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                     });
                 }
                 current_start = byte_pos;
+                at_word_start = true;
             }
             '>' => {
                 let fd_prefix =
@@ -228,6 +274,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                     offset: redir_start,
                 });
                 current_start = byte_pos;
+                at_word_start = false;
             }
             '<' => {
                 flush_arg(&mut tokens, &mut current, current_start);
@@ -245,8 +292,27 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                     offset: start,
                 });
                 current_start = byte_pos;
+                at_word_start = false;
             }
-            '\n' | '\r' if emit_newline => {
+            '\r' if emit_newline => {
+                flush_arg(&mut tokens, &mut current, current_start);
+                let start = byte_pos;
+                let mut value = '\r'.to_string();
+                byte_pos += char_len;
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                    value.push('\n');
+                    byte_pos += 1;
+                }
+                tokens.push(ParsedToken {
+                    kind: TokenKind::Operator,
+                    value,
+                    offset: start,
+                });
+                current_start = byte_pos;
+                at_word_start = true;
+            }
+            '\n' if emit_newline => {
                 flush_arg(&mut tokens, &mut current, current_start);
                 tokens.push(ParsedToken {
                     kind: TokenKind::Operator,
@@ -255,11 +321,13 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 });
                 byte_pos += char_len;
                 current_start = byte_pos;
+                at_word_start = true;
             }
             c if c.is_whitespace() => {
                 flush_arg(&mut tokens, &mut current, current_start);
                 byte_pos += c.len_utf8();
                 current_start = byte_pos;
+                at_word_start = true;
             }
             _ => {
                 if current.is_empty() {
@@ -267,6 +335,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 }
                 current.push(c);
                 byte_pos += char_len;
+                at_word_start = false;
             }
         }
     }
@@ -291,7 +360,9 @@ fn flush_arg(tokens: &mut Vec<ParsedToken>, current: &mut String, offset: usize)
 /// Returns `true` when `cmd` contains a shell boundary that changes command
 /// sequencing or routing outside quoted strings.
 pub(super) fn contains_compound_boundary(cmd: &str) -> bool {
-    tokenize(cmd).iter().any(is_compound_boundary_token)
+    tokenize_with_newlines(cmd)
+        .iter()
+        .any(is_compound_boundary_token)
 }
 
 fn is_compound_boundary_token(token: &ParsedToken) -> bool {
@@ -337,20 +408,45 @@ fn contains_substitution(cmd: &str) -> bool {
     let bytes = cmd.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_comment = false;
+    let mut at_word_start = true;
     let mut i = 0;
     while i < bytes.len() {
+        if in_comment {
+            if matches!(bytes[i], b'\n' | b'\r') {
+                in_comment = false;
+                at_word_start = true;
+            }
+            i += 1;
+            continue;
+        }
         match bytes[i] {
             b'\\' if !in_single => {
                 i += 2;
+                at_word_start = false;
                 continue;
             }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                at_word_start = false;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                at_word_start = false;
+            }
+            b'#' if !in_single && !in_double && at_word_start => {
+                in_comment = true;
+                i += 1;
+                continue;
+            }
             b'`' if !in_single => return true,
             b'$' if !in_single && bytes.get(i + 1) == Some(&b'(') => return true,
             b'<' | b'>' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'(') => {
                 return true
             }
+            b' ' | b'\t' | b'\n' | b'\r' if !in_single && !in_double => at_word_start = true,
+            b';' | b'|' | b'&' if !in_single && !in_double => at_word_start = true,
+            _ if !in_single && !in_double => at_word_start = false,
             _ => {}
         }
         i += 1;
@@ -1007,6 +1103,33 @@ mod tests {
     }
 
     #[test]
+    fn test_comments_hide_shell_syntax_until_newline() {
+        let tokens = tokenize("git status # | grep hidden");
+        assert!(!tokens
+            .iter()
+            .any(|token| { matches!(token.kind, TokenKind::Pipe(_) | TokenKind::Operator) }));
+        assert_eq!(
+            tokenize("git status # | grep hidden\ngit log")
+                .iter()
+                .filter(|token| token.kind == TokenKind::Arg)
+                .map(|token| token.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git", "status", "git", "log"]
+        );
+    }
+
+    #[test]
+    fn test_newline_token_preserves_crlf_width() {
+        let tokens = tokenize_inner("git status\r\ngit log", true);
+        let newline = tokens
+            .iter()
+            .find(|token| token.kind == TokenKind::Operator)
+            .expect("CRLF should be one operator");
+        assert_eq!(newline.value, "\r\n");
+        assert_eq!(newline.offset, "git status".len());
+    }
+
+    #[test]
     fn test_boundaries_and_unattestable_constructs_ignore_quoted_syntax() {
         for (cmd, expected) in [
             ("git status && cargo test", true),
@@ -1025,6 +1148,7 @@ mod tests {
             ("git status > /dev/null", None),
             ("git status 2>&1", None),
             ("echo '$(date)'", None),
+            ("git status # $(date)", None),
             (
                 "echo \"$(date)\"",
                 Some(UnattestableConstruct::Substitution),
