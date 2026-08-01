@@ -5,8 +5,12 @@ use regex::{Regex, RegexSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use super::lexer::{shell_split, split_on_operators, tokenize, ParsedToken, PipeKind, TokenKind};
+use super::lexer::{
+    contains_compound_boundary, first_unattestable_construct, split_on_operators, tokenize,
+    ParsedToken, PipeKind, TokenKind, UnattestableConstruct,
+};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
+use super::suffix::{split_rewrite_suffix, SuffixSafety};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
 
@@ -23,6 +27,12 @@ pub enum Classification {
         base_command: String,
     },
     Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteResult {
+    pub(crate) command: String,
+    pub(crate) requires_ask: bool,
 }
 
 /// Average token counts per category for estimation when no output_len available.
@@ -489,42 +499,6 @@ pub fn strip_disabled_prefix(cmd: &str) -> (&str, &str) {
     (prefix_part, rest)
 }
 
-fn strip_trailing_redirects(cmd: &str) -> (&str, &str) {
-    let tokens = tokenize(cmd);
-    if tokens.is_empty() {
-        return (cmd, "");
-    }
-
-    let mut redir_boundary = tokens.len();
-    let mut i = tokens.len();
-    while i > 0 {
-        i -= 1;
-        match tokens[i].kind {
-            TokenKind::Redirect => {
-                redir_boundary = i;
-            }
-            TokenKind::Arg => {
-                if i > 0 && tokens[i - 1].kind == TokenKind::Redirect {
-                    redir_boundary = i - 1;
-                    i -= 1;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    if redir_boundary >= tokens.len() {
-        return (cmd, "");
-    }
-
-    let cut = tokens[redir_boundary].offset;
-    let cmd_part = cmd[..cut].trim_end();
-    let redir_part = &cmd[cmd_part.len()..];
-    (cmd_part, redir_part)
-}
-
 /// Matches a bash line-continuation: a backslash immediately followed by
 /// `\n` or `\r\n`, *plus* any horizontal whitespace on the line before AND
 /// after the break. This is what bash already collapses to a single space
@@ -545,8 +519,8 @@ fn collapse_line_continuations(s: &str) -> std::borrow::Cow<'_, str> {
 /// Returns `None` if the command is unsupported or ignored (hook should pass through).
 ///
 /// Handles compound commands (`&&`, `||`, `;`) by rewriting each segment independently.
-/// For pipelines, preserves intermediate stages and only rewrites a pipeline-safe final stage,
-/// then continues rewriting segments after subsequent `&&`/`||`/`;` operators.
+/// For pipelines, preserves producers and content-sensitive consumers, rewrites only
+/// display-only tails, then continues rewriting segments after subsequent `&&`/`||`/`;` operators.
 /// Also strips user-configured transparent wrapper prefixes
 /// (`[hooks].transparent_prefixes` in `config.toml`) before routing.
 ///
@@ -566,6 +540,14 @@ pub fn rewrite_command(
     excluded: &[String],
     transparent_prefixes: &[String],
 ) -> Option<String> {
+    rewrite_command_with_policy(cmd, excluded, transparent_prefixes).map(|result| result.command)
+}
+
+pub(crate) fn rewrite_command_with_policy(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+) -> Option<RewriteResult> {
     // Bash line continuations (`\<NL>`, `\<CRLF>`) and the leading whitespace that
     // follows are syntactically equivalent to a single space, but `cmd.trim()` does
     // not unwrap them so a leading backslash-newline used to defeat the whole matcher.
@@ -586,19 +568,31 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    let has_compound = trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains('|')
-        || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
-        return Some(trimmed.to_string());
+    if (trimmed.starts_with("rtk ") || trimmed == "rtk") && !contains_compound_boundary(trimmed) {
+        let suffix = split_rewrite_suffix(trimmed);
+        return Some(with_rewrite_policy(
+            trimmed,
+            RewriteResult {
+                command: trimmed.to_string(),
+                requires_ask: suffix.safety == SuffixSafety::AskOnly,
+            },
+        ));
     }
 
     rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+        .map(|result| with_rewrite_policy(trimmed, result))
 }
 
-/// Pipeline boundaries used to rewrite its final stage.
+fn with_rewrite_policy(cmd: &str, mut result: RewriteResult) -> RewriteResult {
+    result.requires_ask |= matches!(
+        first_unattestable_construct(cmd),
+        Some(UnattestableConstruct::FileTargetRedirect)
+    );
+    result
+}
+
+/// Pipeline boundaries used to preserve a complete shell pipeline while
+/// deciding whether its producer can be safely routed through RTK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PipelineAnalysis {
     end_offset: usize,
@@ -660,31 +654,76 @@ fn analyze_pipeline(
     }
 }
 
-fn rewrite_pipeline_final_stage(
-    cmd: &str,
-    segment_start: usize,
-    analysis: PipelineAnalysis,
-    excluded: &[ExcludePattern],
-    transparent_prefixes: &[String],
-) -> Option<String> {
-    let final_stage_start = analysis.final_stage_start?;
-    let final_stage = cmd[final_stage_start..analysis.end_offset].trim();
+fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
+    let tokens = tokenize(pipe_tail);
+    if tokens.is_empty() {
+        return false;
+    }
 
-    rewrite_segment_inner(
-        final_stage,
-        excluded,
-        transparent_prefixes,
-        RewriteContext::PipelineFinal,
-        0,
-    )
-    .filter(|rewritten| rewritten != final_stage)
-    .map(|rewritten| {
-        format!(
-            "{} {}",
-            cmd[segment_start..final_stage_start].trim(),
-            rewritten
-        )
-    })
+    let mut idx = 0;
+    let mut saw_stage = false;
+    while idx < tokens.len() {
+        if tokens[idx].kind != TokenKind::Pipe(PipeKind::Stdout) {
+            return false;
+        }
+        idx += 1;
+
+        if idx >= tokens.len() || tokens[idx].kind != TokenKind::Arg {
+            return false;
+        }
+        let command = strip_absolute_path(&tokens[idx].value);
+        idx += 1;
+
+        let args_start = idx;
+        while idx < tokens.len() && !matches!(tokens[idx].kind, TokenKind::Pipe(_)) {
+            if tokens[idx].kind != TokenKind::Arg {
+                return false;
+            }
+            idx += 1;
+        }
+
+        let accepts = match command.as_str() {
+            "head" | "tail" => head_tail_reads_stdin_only(&tokens[args_start..idx]),
+            "cat" => idx == args_start,
+            _ => false,
+        };
+        if !accepts {
+            return false;
+        }
+        saw_stage = true;
+    }
+
+    saw_stage
+}
+
+fn head_tail_reads_stdin_only(args: &[ParsedToken]) -> bool {
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].value.as_str() {
+            "-n" | "--lines" => {
+                idx += 1;
+                if idx >= args.len() || !is_decimal_count(&args[idx].value) {
+                    return false;
+                }
+            }
+            value if is_short_line_count(value) || is_long_line_count(value) => {}
+            _ => return false,
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn is_short_line_count(value: &str) -> bool {
+    value.strip_prefix('-').is_some_and(is_decimal_count)
+}
+
+fn is_long_line_count(value: &str) -> bool {
+    value.strip_prefix("--lines=").is_some_and(is_decimal_count)
+}
+
+fn is_decimal_count(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -692,7 +731,7 @@ fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
-) -> Option<String> {
+) -> Option<RewriteResult> {
     let tokens = tokenize(cmd);
     let has_pipe = tokens
         .iter()
@@ -706,6 +745,7 @@ fn rewrite_compound(
 
     let mut result = String::with_capacity(cmd.len() + 32);
     let mut any_changed = false;
+    let mut requires_ask = false;
     let mut seg_start: usize = 0;
 
     for tok in &tokens {
@@ -715,12 +755,16 @@ fn rewrite_compound(
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
-                if rewritten != seg {
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+                let command = rewritten
+                    .as_ref()
+                    .map(|result| result.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
                     any_changed = true;
                 }
-                result.push_str(&rewritten);
+                requires_ask |= rewritten.as_ref().is_some_and(|result| result.requires_ask);
+                result.push_str(command);
                 if tok.value == ";" {
                     result.push(';');
                     let after = tok.offset + tok.value.len();
@@ -739,20 +783,27 @@ fn rewrite_compound(
             }
             TokenKind::Pipe(_) => {
                 let analysis = analyze_pipeline(cmd, &tokens, seg_start, tok.offset);
-                let pipeline = cmd[seg_start..analysis.end_offset].trim();
-                let rewritten_pipeline = rewrite_pipeline_final_stage(
-                    cmd,
-                    seg_start,
-                    analysis,
-                    excluded,
-                    transparent_prefixes,
-                );
-
-                if let Some(rewritten) = rewritten_pipeline {
-                    any_changed = true;
-                    result.push_str(&rewritten);
+                let seg = cmd[seg_start..tok.offset].trim();
+                let pipe_tail = cmd[tok.offset..analysis.end_offset].trim();
+                let rewritten = if analysis.final_stage_start.is_some()
+                    && pipe_tail_accepts_filtered_output(pipe_tail)
+                {
+                    rewrite_segment(seg, excluded, transparent_prefixes)
                 } else {
-                    result.push_str(pipeline);
+                    None
+                };
+                let command = rewritten
+                    .as_ref()
+                    .map(|result| result.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
+                    any_changed = true;
+                }
+                requires_ask |= rewritten.as_ref().is_some_and(|result| result.requires_ask);
+                result.push_str(command);
+                if !pipe_tail.is_empty() {
+                    result.push(' ');
+                    result.push_str(pipe_tail);
                 }
 
                 match analysis.next_clause_offset {
@@ -761,18 +812,29 @@ fn rewrite_compound(
                         continue;
                     }
                     None => {
-                        return if any_changed { Some(result) } else { None };
+                        return if any_changed {
+                            Some(RewriteResult {
+                                command: result,
+                                requires_ask,
+                            })
+                        } else {
+                            None
+                        };
                     }
                 }
             }
             TokenKind::Shellism if tok.value == "&" => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
-                    .unwrap_or_else(|| seg.to_string());
-                if rewritten != seg {
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+                let command = rewritten
+                    .as_ref()
+                    .map(|result| result.command.as_str())
+                    .unwrap_or(seg);
+                if command != seg {
                     any_changed = true;
                 }
-                result.push_str(&rewritten);
+                requires_ask |= rewritten.as_ref().is_some_and(|result| result.requires_ask);
+                result.push_str(command);
                 result.push_str(" & ");
                 seg_start = tok.offset + tok.value.len();
                 while seg_start < cmd.len() && cmd.as_bytes().get(seg_start) == Some(&b' ') {
@@ -784,15 +846,22 @@ fn rewrite_compound(
     }
 
     let seg = cmd[seg_start..].trim();
-    let rewritten =
-        rewrite_segment(seg, excluded, transparent_prefixes).unwrap_or_else(|| seg.to_string());
-    if rewritten != seg {
+    let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
+    let command = rewritten
+        .as_ref()
+        .map(|result| result.command.as_str())
+        .unwrap_or(seg);
+    if command != seg {
         any_changed = true;
     }
-    result.push_str(&rewritten);
+    requires_ask |= rewritten.as_ref().is_some_and(|result| result.requires_ask);
+    result.push_str(command);
 
     if any_changed {
-        Some(result)
+        Some(RewriteResult {
+            command: result,
+            requires_ask,
+        })
     } else {
         None
     }
@@ -842,32 +911,6 @@ fn builtin_transparent_prefixes() -> impl Iterator<Item = (&'static str, bool)> 
 }
 
 const MAX_PREFIX_DEPTH: usize = 10;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RewriteContext {
-    Normal,
-    PipelineFinal,
-}
-
-/// Checks whether grep or rg reads patterns from a file.
-fn search_uses_pattern_file(cmd: &str) -> bool {
-    shell_split(cmd)
-        .into_iter()
-        .skip(1)
-        .take_while(|arg| arg != "--")
-        .any(|arg| {
-            arg == "--file"
-                || arg.starts_with("--file=")
-                || arg
-                    .strip_prefix('-')
-                    .filter(|flags| !flags.starts_with('-'))
-                    .is_some_and(|flags| flags.contains('f'))
-        })
-}
-
-fn pipeline_final_command_is_safe(rtk_cmd: &str, cmd: &str) -> bool {
-    !matches!(rtk_cmd, "rtk grep" | "rtk rg") || !search_uses_pattern_file(cmd)
-}
 
 enum ExcludePattern {
     Regex(Regex),
@@ -923,14 +966,8 @@ fn rewrite_segment(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
-) -> Option<String> {
-    rewrite_segment_inner(
-        seg,
-        excluded,
-        transparent_prefixes,
-        RewriteContext::Normal,
-        0,
-    )
+) -> Option<RewriteResult> {
+    rewrite_segment_inner(seg, excluded, transparent_prefixes, 0)
 }
 
 fn is_excluded(cmd: &str, excluded: &[ExcludePattern]) -> bool {
@@ -944,9 +981,8 @@ fn rewrite_segment_inner(
     seg: &str,
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
-    context: RewriteContext,
     depth: usize,
-) -> Option<String> {
+) -> Option<RewriteResult> {
     let trimmed = seg.trim();
     if trimmed.is_empty() {
         return None;
@@ -967,14 +1003,12 @@ fn rewrite_segment_inner(
             );
             return None;
         }
-        let rewritten = rewrite_segment_inner(
-            rest_after_env,
-            excluded,
-            transparent_prefixes,
-            context,
-            depth + 1,
-        )?;
-        return Some(format!("{}{}", env_prefix, rewritten));
+        let rewritten =
+            rewrite_segment_inner(rest_after_env, excluded, transparent_prefixes, depth + 1)?;
+        return Some(RewriteResult {
+            command: format!("{}{}", env_prefix, rewritten.command),
+            requires_ask: rewritten.requires_ask,
+        });
     }
 
     for (prefix, routable) in builtin_transparent_prefixes() {
@@ -983,9 +1017,12 @@ fn rewrite_segment_inner(
                 return None;
             }
             if let Some(rewritten) =
-                rewrite_segment_inner(rest, excluded, transparent_prefixes, context, depth + 1)
+                rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
             {
-                return Some(format!("{} {}", prefix, rewritten));
+                return Some(RewriteResult {
+                    command: format!("{} {}", prefix, rewritten.command),
+                    requires_ask: rewritten.requires_ask,
+                });
             }
             // #2768: falling through re-tests the full prefixed string, which is
             // only valid when the wrapper is itself a routable command.
@@ -1003,24 +1040,34 @@ fn rewrite_segment_inner(
             if rest.is_empty() {
                 return None;
             }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, context, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1).map(
+                |rewritten| RewriteResult {
+                    command: format!("{} {}", prefix, rewritten.command),
+                    requires_ask: rewritten.requires_ask,
+                },
+            );
         }
     }
 
-    // Strip trailing stderr/stdout redirects before matching (#530)
-    // e.g. "git status 2>&1" → match "git status", re-append " 2>&1"
-    let (cmd_part, redirect_suffix) = strip_trailing_redirects(trimmed);
+    // Strip safe trailing output redirects before matching, then reattach the
+    // original bytes. File targets remain rewriteable but require approval.
+    let suffix = split_rewrite_suffix(trimmed);
+    let cmd_part = suffix.core;
+    let redirect_suffix = suffix.suffix;
 
     // Already RTK — pass through unchanged
     if cmd_part.starts_with("rtk ") || cmd_part == "rtk" {
-        return Some(trimmed.to_string());
+        return Some(RewriteResult {
+            command: trimmed.to_string(),
+            requires_ask: suffix.safety == SuffixSafety::AskOnly,
+        });
     }
 
-    if context == RewriteContext::Normal
-        && (cmd_part.starts_with("head -") || cmd_part.starts_with("tail "))
-    {
-        return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
+    if cmd_part.starts_with("head -") || cmd_part.starts_with("tail ") {
+        return rewrite_line_range(cmd_part).map(|command| RewriteResult {
+            command: format!("{}{}", command, redirect_suffix),
+            requires_ask: suffix.safety == SuffixSafety::AskOnly,
+        });
     }
 
     // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
@@ -1045,9 +1092,6 @@ fn rewrite_segment_inner(
         }
         // TOML-only commands: consult the registry so the hook filters them too (#2179).
         Classification::Unsupported { .. } => {
-            if context == RewriteContext::PipelineFinal {
-                return None;
-            }
             if crate::core::toml_filter::toml_disabled() {
                 return None;
             }
@@ -1060,7 +1104,10 @@ fn rewrite_segment_inner(
                 return None;
             }
             if crate::core::toml_filter::command_matches_filter(&normalized) {
-                return Some(format!("rtk {}{}", cmd_part, redirect_suffix));
+                return Some(RewriteResult {
+                    command: format!("rtk {}{}", cmd_part, redirect_suffix),
+                    requires_ask: suffix.safety == SuffixSafety::AskOnly,
+                });
             }
             return None;
         }
@@ -1069,12 +1116,6 @@ fn rewrite_segment_inner(
 
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
-    if context == RewriteContext::PipelineFinal
-        && (!rule.pipeline_final_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
-    {
-        return None;
-    }
-
     if let Some(parts) = parse_golangci_run_parts(cmd_part) {
         let rewritten = if parts.global_segment.is_empty() {
             format!("rtk golangci-lint {}", parts.run_segment)
@@ -1084,7 +1125,10 @@ fn rewrite_segment_inner(
                 parts.global_segment, parts.run_segment
             )
         };
-        return Some(rewritten);
+        return Some(RewriteResult {
+            command: format!("{}{}", rewritten, redirect_suffix),
+            requires_ask: suffix.safety == SuffixSafety::AskOnly,
+        });
     }
 
     // #196: gh with --json/--jq/--template produces structured output that
@@ -1128,7 +1172,10 @@ fn rewrite_segment_inner(
             } else {
                 format!("{} {}{}", rule.rtk_cmd, rest, redirect_suffix)
             };
-            return Some(rewritten);
+            return Some(RewriteResult {
+                command: rewritten,
+                requires_ask: suffix.safety == SuffixSafety::AskOnly,
+            });
         }
     }
 
@@ -1209,34 +1256,6 @@ mod tests {
             cmd[analysis.final_stage_start.unwrap()..analysis.end_offset].trim(),
             "grep FAILED"
         );
-    }
-
-    #[test]
-    fn test_pipeline_final_safe_rule_set() {
-        let safe_rules: Vec<_> = RULES
-            .iter()
-            .filter(|rule| rule.pipeline_final_safe)
-            .map(|rule| rule.rtk_cmd)
-            .collect();
-
-        assert_eq!(safe_rules, vec!["rtk grep", "rtk rg"]);
-    }
-
-    #[test]
-    fn test_pipeline_final_search_pattern_file_is_unsafe() {
-        for command in [
-            "grep -f patterns.txt input.txt",
-            "grep -rfpatterns.txt input",
-            "grep --file patterns.txt input.txt",
-            "grep --file=patterns.txt input.txt",
-            "rg -f patterns.txt input.txt",
-            "rg --file=patterns.txt input.txt",
-        ] {
-            assert!(search_uses_pattern_file(command), "{command}");
-        }
-
-        assert!(!search_uses_pattern_file("grep -- -f"));
-        assert!(!search_uses_pattern_file("grep -F pattern"));
     }
 
     #[test]
@@ -1757,10 +1776,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_toml_pipe_rewrites_only_safe_final() {
+    fn test_rewrite_toml_pipe_preserves_raw_consumer() {
         assert_eq!(
             rewrite_command_no_prefixes("jj log | grep change", &[]),
-            Some("jj log | rtk grep change".into())
+            None
         );
     }
 
@@ -1935,10 +1954,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_pipe_final_safe_stage_only() {
+    fn test_rewrite_pipe_preserves_raw_grep() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("git log -10 | rtk grep feat".into())
+            None
         );
     }
 
@@ -1969,10 +1988,10 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_pipe_unsafe_final_stage_stays_raw() {
+    fn test_rewrite_pipe_recovers_display_tail_rewrite() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | tail -50", &[]),
-            None
+            Some("rtk cargo test | tail -50".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("find . | xargs grep TODO", &[]),
@@ -2171,7 +2190,7 @@ mod tests {
     fn test_rewrite_redirect_2_gt_amp_1_with_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test 2>&1 | grep FAILED", &[]),
-            Some("cargo test 2>&1 | rtk grep FAILED".into())
+            None
         );
     }
 
@@ -2190,6 +2209,22 @@ mod tests {
             rewrite_command_no_prefixes("git status 2>/dev/null", &[]),
             Some("rtk git status 2>/dev/null".into())
         );
+    }
+
+    #[test]
+    fn test_file_redirect_requires_ask_in_any_rewritten_clause() {
+        for command in [
+            "git status > /tmp/status.log",
+            "git status && git log > /tmp/log.txt",
+            "git log > /tmp/log.txt | head -5",
+        ] {
+            let result = rewrite_command_with_policy(command, &[], &[])
+                .expect("command should still have a rewrite");
+            assert!(
+                result.requires_ask,
+                "file redirect must be ask-only: {command}"
+            );
+        }
     }
 
     #[test]
@@ -3887,10 +3922,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // Producers stay raw; only a pipeline-safe final stage is rewritten.
+        // Content-sensitive consumers must receive the producer's raw output.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("cargo test | rtk grep FAILED".into())
+            None
         );
     }
 
@@ -3898,7 +3933,7 @@ mod tests {
     fn test_rewrite_compound_pipe_git_grep() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("git log -10 | rtk grep feat".into())
+            None
         );
     }
 
@@ -4632,7 +4667,7 @@ mod tests {
     fn test_rewrite_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("git log | head -5 && rtk git stash".into())
+            Some("rtk git log | head -5 && rtk git stash".into())
         );
     }
 
@@ -4640,7 +4675,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("cargo test | head; rtk git status".into())
+            Some("rtk cargo test | head; rtk git status".into())
         );
     }
 
@@ -4648,7 +4683,7 @@ mod tests {
     fn test_rewrite_pipe_then_or() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("cargo test | rtk grep FAIL || rtk git stash".into())
+            Some("cargo test | grep FAIL || rtk git stash".into())
         );
     }
 
@@ -4659,7 +4694,7 @@ mod tests {
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 cargo test 2>&1 | rtk grep FAILED && rtk git stash".into())
+            Some("RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && rtk git stash".into())
         );
     }
 
@@ -4667,7 +4702,7 @@ mod tests {
     fn test_rewrite_and_then_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && cargo test | rtk grep FAIL".into())
+            Some("rtk git status && cargo test | grep FAIL".into())
         );
     }
 
@@ -4675,15 +4710,15 @@ mod tests {
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("git log | head | tail && rtk git status".into())
+            Some("rtk git log | head | tail && rtk git status".into())
         );
     }
 
     #[test]
-    fn test_rewrite_pipeline_final_normalizes_prefixes() {
+    fn test_rewrite_pipeline_wrappers_preserve_raw_consumer() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | FOO=1 command grep FAILED", &[]),
-            Some("cargo test | FOO=1 command rtk grep FAILED".into())
+            None
         );
         assert_eq!(
             super::rewrite_command(
@@ -4691,7 +4726,7 @@ mod tests {
                 &[],
                 &["docker exec tools".into()]
             ),
-            Some("cargo test | docker exec tools rtk grep FAILED".into())
+            None
         );
     }
 

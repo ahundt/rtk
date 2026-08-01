@@ -288,19 +288,47 @@ fn flush_arg(tokens: &mut Vec<ParsedToken>, current: &mut String, offset: usize)
     }
 }
 
-/// True for constructs the permission gate can't decompose, so they must never
-/// be auto-allowed: command/process substitution, or a real file-target redirect
-/// (fd-dup like `2>&1` and `/dev/null` are exempt). Separators and subshells are
-/// handled by [`split_for_permissions`], not flagged here.
-pub fn contains_unattestable_construct(cmd: &str) -> bool {
+/// Returns `true` when `cmd` contains a shell boundary that changes command
+/// sequencing or routing outside quoted strings.
+pub(super) fn contains_compound_boundary(cmd: &str) -> bool {
+    tokenize(cmd).iter().any(is_compound_boundary_token)
+}
+
+fn is_compound_boundary_token(token: &ParsedToken) -> bool {
+    matches!(token.kind, TokenKind::Operator | TokenKind::Pipe(_))
+        || (token.kind == TokenKind::Shellism && token.value == "&")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnattestableConstruct {
+    Substitution,
+    FileTargetRedirect,
+}
+
+/// Returns the first construct the permission gate can't decompose. These
+/// constructs must never be auto-allowed: command/process substitution, or a
+/// real file-target redirect (fd-dup like `2>&1` and `/dev/null` are exempt).
+/// Separators and subshells are handled by [`split_for_permissions`].
+pub(crate) fn first_unattestable_construct(cmd: &str) -> Option<UnattestableConstruct> {
     if contains_substitution(cmd) {
-        return true;
+        return Some(UnattestableConstruct::Substitution);
     }
     let tokens = tokenize(cmd);
-    tokens
+    if tokens
         .iter()
         .enumerate()
         .any(|(i, tok)| tok.kind == TokenKind::Redirect && redirect_has_file_target(&tokens, i))
+    {
+        Some(UnattestableConstruct::FileTargetRedirect)
+    } else {
+        None
+    }
+}
+
+/// True for constructs the permission gate can't decompose, so they must never
+/// be auto-allowed.
+pub fn contains_unattestable_construct(cmd: &str) -> bool {
+    first_unattestable_construct(cmd).is_some()
 }
 
 /// Quote-aware: bash runs backtick/`$(...)` unquoted and inside double quotes,
@@ -332,13 +360,18 @@ fn contains_substitution(cmd: &str) -> bool {
 
 // `>&N`/`>&-` (and `N>&M`) is fd-dup/close; bare `>&` before a word is
 // `>word 2>&1` — a file target.
+pub(super) fn redirect_is_fd_dup_or_close(value: &str) -> bool {
+    let Some(pos) = value.find(">&") else {
+        return false;
+    };
+    let tail = &value[pos + 2..];
+    !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-')
+}
+
 fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
     let value = &tokens[i].value;
-    if let Some(pos) = value.find(">&") {
-        let tail = &value[pos + 2..];
-        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit() || c == '-') {
-            return false;
-        }
+    if redirect_is_fd_dup_or_close(value) {
+        return false;
     }
     match tokens.get(i + 1) {
         Some(next) if next.kind == TokenKind::Arg => next.value != "/dev/null",
@@ -971,6 +1004,34 @@ mod tests {
             .iter()
             .any(|t| t.kind == TokenKind::Shellism && t.value == "&"));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Redirect));
+    }
+
+    #[test]
+    fn test_boundaries_and_unattestable_constructs_ignore_quoted_syntax() {
+        for (cmd, expected) in [
+            ("git status && cargo test", true),
+            ("git log | head -5", true),
+            ("echo 'a && b | c'", false),
+            ("echo \"a; b\" &", true),
+        ] {
+            assert_eq!(contains_compound_boundary(cmd), expected, "{cmd}");
+        }
+
+        for (cmd, expected) in [
+            (
+                "git status > /tmp/status.log",
+                Some(UnattestableConstruct::FileTargetRedirect),
+            ),
+            ("git status > /dev/null", None),
+            ("git status 2>&1", None),
+            ("echo '$(date)'", None),
+            (
+                "echo \"$(date)\"",
+                Some(UnattestableConstruct::Substitution),
+            ),
+        ] {
+            assert_eq!(first_unattestable_construct(cmd), expected, "{cmd}");
+        }
     }
 
     #[test]
