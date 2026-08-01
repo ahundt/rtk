@@ -20,6 +20,7 @@ pub const RTK_META_COMMANDS: &[&str] = &[
     "pipe",
     "cc-economics",
     "verify",
+    "trash",
     "trust",
     "untrust",
     "session",
