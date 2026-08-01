@@ -143,23 +143,24 @@ rewrite_compound(cmd, excluded)                    [src/discover/registry.rs]
   |
   |  Step 2 — Split on operators, rewrite each segment
   |  Operator (&&, ||, ;) → rewrite both sides
-  |  Pipe (|) → keep producers/intermediate stages raw
-  |             rewrite only a pipeline-safe final stage
+  |  Pipe (|) → keep content-sensitive stages raw
+  |             rewrite producer only for stdin-safe head/tail/cat tails
   |  Stderr pipe (|&) → keep the complete pipeline raw
   |  Shellism (&) → rewrite both sides (background)
   |
   |  Calls rewrite_segment() per segment:
   |    segment 1: "cargo fmt --all"
   |    segment 2: "cargo test 2>&1"
-  |    after pipe: "tail -20" kept raw
+  |    after pipe: "tail -20" kept raw; producer may be rewritten
   |
   v
 rewrite_segment(seg, excluded)                     [src/discover/registry.rs]
   |
-  |  Step 3 — Strip trailing redirects
-  |  strip_trailing_redirects() re-tokenizes the segment:
-  |    "cargo test 2>&1" → cmd_part="cargo test", redirect=" 2>&1"
-  |  (simple commands like "cargo fmt --all" → no redirect, suffix is "")
+  |  Step 3 — Split trailing output routing
+  |  split_rewrite_suffix() re-tokenizes the segment:
+  |    "cargo test 2>&1" → core="cargo test", suffix=" 2>&1"
+  |  File targets remain attached and mark the rewrite ask-only;
+  |  fd duplication and /dev/null remain auto-allow eligible.
   |
   |  Step 4 — Already RTK → return as-is
   |
@@ -208,7 +209,7 @@ LLM Agent executes rewritten command
 Key design decisions:
 - **Lexer-based tokenization**: A single-pass state machine (`lexer.rs`) handles all shell constructs (quotes, escapes, redirects, operators). Used for both compound splitting and redirect stripping.
 - **Segment-level rewriting**: Compound commands are split by operators, each segment rewritten independently. Bash recombines them at execution time.
-- **Pipe semantics**: Producers and intermediate stages of `|` remain raw. Only an argument-safe final stage whose rule has `pipeline_final_safe` may be rewritten; initially this is limited to ordinary `grep` and `rg` invocations. Search pattern-file forms (`-f`/`--file`) defer because they can consume pipeline stdin as configuration. `|&` is recognized separately and its complete pipeline stays raw.
+- **Pipe semantics**: Producers and content-sensitive consumers such as `grep`, `rg`, `tee`, and `xargs` remain raw. A plain `head`, `tail`, or `cat` tail is accepted only when its arguments read stdin, so the producer can be rewritten without changing output meaning. `|&` is recognized separately and its complete pipeline stays raw.
 - **Double env prefix handling**: `classify_command()` strips env prefixes to match the underlying command against rules. `rewrite_segment()` extracts the same prefix separately to re-prepend it to the rewritten command.
 - **Fallback contract**: If any segment fails to match, it stays raw. `rewrite_command()` returns `None` only when zero segments were rewritten.
 

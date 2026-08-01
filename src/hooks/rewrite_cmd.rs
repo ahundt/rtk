@@ -1,7 +1,8 @@
 //! Translates a raw shell command into its RTK-optimized equivalent.
 
 use super::permissions::{check_command, PermissionVerdict};
-use crate::discover::registry;
+use crate::discover::lexer::{first_unattestable_construct, UnattestableConstruct};
+use crate::discover::registry::rewrite_command_with_policy;
 use std::io::Write;
 
 /// Run the `rtk rewrite` command.
@@ -46,27 +47,36 @@ enum RewriteOutcome {
 
 fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> RewriteOutcome {
     let verdict = check_command(cmd);
+    evaluate_with_verdict(cmd, excluded, transparent_prefixes, verdict)
+}
 
+fn evaluate_with_verdict(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    verdict: PermissionVerdict,
+) -> RewriteOutcome {
     if verdict == PermissionVerdict::Deny {
         return RewriteOutcome::Deny;
     }
 
-    if crate::discover::lexer::contains_unattestable_construct(cmd) {
+    let unattestable = first_unattestable_construct(cmd);
+    if unattestable == Some(UnattestableConstruct::Substitution) {
         return RewriteOutcome::Passthrough;
     }
 
-    match registry::rewrite_command(cmd, excluded, transparent_prefixes) {
-        Some(rewritten) => match verdict {
-            PermissionVerdict::Allow => RewriteOutcome::Allow(rewritten),
-            _ => RewriteOutcome::Ask(rewritten),
-        },
+    match rewrite_command_with_policy(cmd, excluded, transparent_prefixes) {
+        Some(rewritten) if !rewritten.requires_ask && verdict == PermissionVerdict::Allow => {
+            RewriteOutcome::Allow(rewritten.command)
+        }
+        Some(rewritten) => RewriteOutcome::Ask(rewritten.command),
         None => RewriteOutcome::Passthrough,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::discover::registry;
 
     fn rewrite_command_no_prefixes(cmd: &str) -> Option<String> {
         registry::rewrite_command(cmd, &[], &[])
@@ -91,12 +101,21 @@ mod tests {
     }
 
     mod unattestable_passthrough {
-        use super::super::{evaluate, RewriteOutcome};
+        use super::super::{evaluate_with_verdict, RewriteOutcome};
+        use crate::hooks::permissions::PermissionVerdict;
+
+        fn evaluate_default(cmd: &str) -> RewriteOutcome {
+            evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Default)
+        }
+
+        fn evaluate_allow(cmd: &str) -> RewriteOutcome {
+            evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Allow)
+        }
 
         #[test]
         fn test_backtick_substitution_passthrough() {
             assert_eq!(
-                evaluate("git status `rm -rf /tmp/x`", &[], &[]),
+                evaluate_default("git status `rm -rf /tmp/x`"),
                 RewriteOutcome::Passthrough
             );
         }
@@ -104,7 +123,7 @@ mod tests {
         #[test]
         fn test_dollar_substitution_passthrough() {
             assert_eq!(
-                evaluate("git status $(rm -rf /tmp/x)", &[], &[]),
+                evaluate_default("git status $(rm -rf /tmp/x)"),
                 RewriteOutcome::Passthrough
             );
         }
@@ -112,23 +131,31 @@ mod tests {
         #[test]
         fn test_double_quoted_substitution_passthrough() {
             assert_eq!(
-                evaluate("git log --pretty=\"$(rm -rf /tmp/x)\"", &[], &[]),
+                evaluate_default("git log --pretty=\"$(rm -rf /tmp/x)\""),
                 RewriteOutcome::Passthrough
             );
         }
 
         #[test]
-        fn test_file_redirect_passthrough() {
+        fn test_file_redirect_rewrites_as_ask() {
             assert_eq!(
-                evaluate("git log > /tmp/out.txt", &[], &[]),
-                RewriteOutcome::Passthrough
+                evaluate_default("git log > /tmp/out.txt"),
+                RewriteOutcome::Ask("rtk git log > /tmp/out.txt".into())
+            );
+        }
+
+        #[test]
+        fn test_file_redirect_never_auto_allows() {
+            assert_eq!(
+                evaluate_allow("git log > /tmp/out.txt"),
+                RewriteOutcome::Ask("rtk git log > /tmp/out.txt".into())
             );
         }
 
         #[test]
         fn test_fd_dup_redirect_still_rewrites() {
             assert!(matches!(
-                evaluate("git status 2>&1", &[], &[]),
+                evaluate_default("git status 2>&1"),
                 RewriteOutcome::Ask(_)
             ));
         }
@@ -136,7 +163,7 @@ mod tests {
         #[test]
         fn test_plain_command_still_rewrites() {
             assert!(matches!(
-                evaluate("git status", &[], &[]),
+                evaluate_default("git status"),
                 RewriteOutcome::Ask(_)
             ));
         }
