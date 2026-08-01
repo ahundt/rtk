@@ -14,6 +14,7 @@ use crate::hooks::constants::{
     CURSOR_DIR, GEMINI_DIR, GITHUB_DIR, OPENCODE_PLUGIN_FILE, OPENCODE_SUBDIR, PLUGIN_SUBDIR,
 };
 
+use super::codex;
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND, DROID_DIR,
     DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
@@ -287,13 +288,12 @@ pub fn run(
         if hook_only {
             anyhow::bail!("--codex cannot be combined with --hook-only");
         }
-        if matches!(patch_mode, PatchMode::Auto) {
-            anyhow::bail!("--codex cannot be combined with --auto-patch");
-        }
-        if matches!(patch_mode, PatchMode::Skip) {
-            anyhow::bail!("--codex cannot be combined with --no-patch");
-        }
-        run_codex_mode(global, ctx)?;
+        // `--codex --auto-patch` now ALSO writes ~/.codex/hooks.json
+        // (Codex CLI added PreToolUse Bash interception in v0.117.0).
+        // `--codex --no-patch` keeps the file-only behavior — same as bare
+        // `--codex`. Both are valid; we forward patch_mode into the codex
+        // installer which decides whether to write the hook config.
+        run_codex_mode(global, patch_mode, ctx)?;
     } else {
         // Validation: Global-only features
         if install_opencode && !global {
@@ -955,6 +955,8 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
     )? {
         removed.push("AGENTS.md: removed @RTK.md reference".to_string());
     }
+
+    removed.extend(codex::uninstall_at(codex_dir, ctx)?);
 
     Ok(removed)
 }
@@ -2443,21 +2445,38 @@ fn normalized_yaml_scalar(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn run_codex_mode(global: bool, ctx: InitContext) -> Result<()> {
-    let (agents_md_path, rtk_md_path) = if global {
+fn run_codex_mode(global: bool, patch_mode: PatchMode, ctx: InitContext) -> Result<()> {
+    let (agents_md_path, rtk_md_path, hooks_json_path) = if global {
         let codex_dir = resolve_codex_dir()?;
-        (codex_dir.join(AGENTS_MD), codex_dir.join(RTK_MD))
+        (
+            codex_dir.join(AGENTS_MD),
+            codex_dir.join(RTK_MD),
+            codex::hooks_path(&codex_dir),
+        )
     } else {
-        (PathBuf::from(AGENTS_MD), PathBuf::from(RTK_MD))
+        (
+            PathBuf::from(AGENTS_MD),
+            PathBuf::from(RTK_MD),
+            codex::hooks_path(Path::new(".codex")),
+        )
     };
 
-    run_codex_mode_with_paths(agents_md_path, rtk_md_path, global, ctx)
+    run_codex_mode_with_paths(
+        agents_md_path,
+        rtk_md_path,
+        hooks_json_path,
+        global,
+        patch_mode,
+        ctx,
+    )
 }
 
 fn run_codex_mode_with_paths(
     agents_md_path: PathBuf,
     rtk_md_path: PathBuf,
+    hooks_json_path: PathBuf,
     global: bool,
+    patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
@@ -2488,6 +2507,17 @@ fn run_codex_mode_with_paths(
     write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, RTK_MD, ctx)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, ctx)?;
 
+    // PreToolUse hook installation (opt-in via --auto-patch).
+    // Codex semantics permit multiple matching hooks to run concurrently
+    // (developers.openai.com/codex/hooks), so we APPEND to any existing
+    // hooks.json rather than displacing foreign entries. Idempotent: a
+    // second run with the same rtk binary path is a no-op.
+    let hook_action = if matches!(patch_mode, PatchMode::Auto) {
+        Some(codex::install(&hooks_json_path, ctx)?)
+    } else {
+        None
+    };
+
     if !dry_run {
         println!("\nRTK configured for Codex CLI.\n");
         println!("  RTK.md:    {}", rtk_md_path.display());
@@ -2495,6 +2525,37 @@ fn run_codex_mode_with_paths(
             println!("  AGENTS.md: {} reference added", rtk_md_ref);
         } else {
             println!("  AGENTS.md: {} reference already present", rtk_md_ref);
+        }
+        match hook_action {
+            Some(codex::HookUpsert::Added) => {
+                println!(
+                    "  hooks.json: PreToolUse hook installed at {}",
+                    hooks_json_path.display()
+                );
+                println!(
+                    "\n  Next: run `codex` and open `/hooks` to review & trust the new RTK hook."
+                );
+            }
+            Some(codex::HookUpsert::Updated) => {
+                println!(
+                    "  hooks.json: existing RTK hook entry updated at {}",
+                    hooks_json_path.display()
+                );
+                println!(
+                    "\n  Note: if you previously trusted this hook, the SHA changed —\n        re-trust via `codex` -> `/hooks` if Codex flags it."
+                );
+            }
+            Some(codex::HookUpsert::Unchanged) => {
+                println!(
+                    "  hooks.json: RTK PreToolUse hook already present (unchanged) at {}",
+                    hooks_json_path.display()
+                );
+            }
+            None => {
+                println!(
+                    "  hooks.json: skipped (file-only mode). Re-run with --auto-patch to install."
+                );
+            }
         }
         if global {
             println!(
@@ -5028,8 +5089,10 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_mode_rejects_auto_patch() {
-        let err = run(
+    fn test_codex_mode_accepts_auto_patch() {
+        // Native Codex hook mode allows --auto-patch so install can write
+        // ~/.codex/hooks.json. Use dry_run to avoid touching the real $HOME.
+        let r = run(
             false,
             false,
             false,
@@ -5040,18 +5103,19 @@ mod tests {
             false,
             true,
             PatchMode::Auto,
-            InitContext::default(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "--codex cannot be combined with --auto-patch"
+            InitContext {
+                dry_run: true,
+                ..Default::default()
+            },
         );
+        assert!(r.is_ok(), "--codex --auto-patch must succeed: {r:?}");
     }
 
     #[test]
-    fn test_codex_mode_rejects_no_patch() {
-        let err = run(
+    fn test_codex_mode_accepts_no_patch() {
+        // --codex --no-patch is file-only mode: RTK.md + AGENTS.md,
+        // no hooks.json. Use dry_run to avoid touching the real $HOME.
+        let r = run(
             false,
             false,
             false,
@@ -5062,13 +5126,12 @@ mod tests {
             false,
             true,
             PatchMode::Skip,
-            InitContext::default(),
-        )
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "--codex cannot be combined with --no-patch"
+            InitContext {
+                dry_run: true,
+                ..Default::default()
+            },
         );
+        assert!(r.is_ok(), "--codex --no-patch must succeed: {r:?}");
     }
 
     #[test]
@@ -5676,14 +5739,22 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let agents_md = temp.path().join("AGENTS.md");
         let rtk_md = temp.path().join("RTK.md");
+        let hooks_json = temp.path().join("hooks.json");
 
         run_codex_mode_with_paths(
             agents_md.clone(),
             rtk_md.clone(),
+            hooks_json.clone(),
             true,
+            PatchMode::Skip,
             InitContext::default(),
         )
         .unwrap();
+        // File-only mode (PatchMode::Skip): hooks.json must NOT be created.
+        assert!(
+            !hooks_json.exists(),
+            "PatchMode::Skip must not write hooks.json"
+        );
 
         assert!(rtk_md.exists());
         assert_eq!(fs::read_to_string(&rtk_md).unwrap(), RTK_SLIM_CODEX);
@@ -6164,17 +6235,25 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let agents_md = temp.path().join("AGENTS.md");
         let rtk_md = temp.path().join("RTK.md");
+        let hooks_json = temp.path().join("hooks.json");
 
         run_codex_mode_with_paths(
             agents_md.clone(),
             rtk_md.clone(),
+            hooks_json.clone(),
             true,
+            PatchMode::Auto,
             InitContext {
                 dry_run: true,
                 ..Default::default()
             },
         )
         .unwrap();
+        assert!(
+            !hooks_json.exists(),
+            "dry-run must not create hooks.json: {}",
+            hooks_json.display()
+        );
 
         assert!(
             !rtk_md.exists(),
