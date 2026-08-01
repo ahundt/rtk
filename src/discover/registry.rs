@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 
 use super::lexer::{
     contains_compound_boundary, first_unattestable_construct, split_on_operators, tokenize,
-    ParsedToken, PipeKind, TokenKind, UnattestableConstruct,
+    tokenize_with_newlines, ParsedToken, PipeKind, TokenKind, UnattestableConstruct,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 use super::suffix::{split_rewrite_suffix, SuffixSafety};
@@ -732,7 +732,7 @@ fn rewrite_compound(
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
 ) -> Option<RewriteResult> {
-    let tokens = tokenize(cmd);
+    let tokens = tokenize_with_newlines(cmd);
     let has_pipe = tokens
         .iter()
         .any(|token| matches!(token.kind, TokenKind::Pipe(_)));
@@ -765,7 +765,9 @@ fn rewrite_compound(
                 }
                 requires_ask |= rewritten.as_ref().is_some_and(|result| result.requires_ask);
                 result.push_str(command);
-                if tok.value == ";" {
+                if matches!(tok.value.as_str(), "\n" | "\r" | "\r\n") {
+                    result.push_str(&tok.value);
+                } else if tok.value == ";" {
                     result.push(';');
                     let after = tok.offset + tok.value.len();
                     if after < cmd.len() {
@@ -2052,6 +2054,26 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("rtk git add . && cargo test", &[]),
             Some("rtk git add . && rtk cargo test".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_newline_separates_commands() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\ngit log", &[]),
+            Some("rtk git status\nrtk git log".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\r\ngit log", &[]),
+            Some("rtk git status\r\nrtk git log".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ignores_pipeline_syntax_in_shell_comments() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status # | grep hidden", &[]),
+            Some("rtk git status # | grep hidden".into())
         );
     }
 
