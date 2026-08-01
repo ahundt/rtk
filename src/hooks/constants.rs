@@ -14,6 +14,8 @@ pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";
 pub const CURSOR_HOOK_COMMAND: &str = "rtk hook cursor";
 /// Native Rust hook command for Factory Droid.
 pub const DROID_HOOK_COMMAND: &str = "rtk hook droid";
+/// Native Rust hook command for Codex CLI PreToolUse.
+pub const CODEX_HOOK_COMMAND: &str = "rtk hook codex";
 
 pub const CONFIG_DIR: &str = ".config";
 pub const OPENCODE_SUBDIR: &str = "opencode";
