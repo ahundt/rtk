@@ -567,13 +567,14 @@ pub fn run_claude() -> Result<()> {
 
     let input = input.trim();
     if input.is_empty() {
+        write_no_opinion_stdout();
         return Ok(());
     }
 
     let v: Value = match serde_json::from_str(input) {
         Ok(v) => v,
-        Err(e) => {
-            let _ = writeln!(io::stderr(), "[rtk hook] Failed to parse JSON input: {e}");
+        Err(_) => {
+            write_no_opinion_stdout();
             return Ok(());
         }
     };
@@ -610,14 +611,23 @@ pub fn run_claude() -> Result<()> {
         }
         PayloadAction::Skip { reason, cmd } => {
             audit_log(reason, &cmd, "");
+            write_no_opinion_stdout();
+        }
+        PayloadAction::Ignore => {
+            write_no_opinion_stdout();
         }
         PayloadAction::Deny { reason, cmd, .. } => {
             audit_log("deny", &cmd, &reason);
         }
-        PayloadAction::Ignore => {}
     }
 
     Ok(())
+}
+
+fn write_no_opinion_stdout() {
+    // Issue #1773: Claude Code expects valid JSON for "no opinion"; zero bytes
+    // can be treated as a malformed hook response.
+    let _ = writeln!(io::stdout(), "{{}}");
 }
 
 #[cfg(test)]
@@ -626,6 +636,24 @@ fn run_claude_inner(input: &str) -> Option<String> {
     match process_claude_payload(&v) {
         PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+fn run_claude_stdout(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "{}\n".to_string();
+    }
+    let v: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return "{}\n".to_string(),
+    };
+    match process_claude_payload(&v) {
+        PayloadAction::Rewrite { output, .. } => format!("{output}\n"),
+        PayloadAction::Skip { .. } | PayloadAction::Deny { .. } | PayloadAction::Ignore => {
+            "{}\n".to_string()
+        }
     }
 }
 
@@ -1560,6 +1588,64 @@ mod tests {
     fn test_claude_no_tool_input_passthrough() {
         let input = json!({ "tool_name": "Bash" }).to_string();
         assert!(run_claude_inner(&input).is_none());
+    }
+
+    fn assert_emits_valid_json(input: &str, context: &str) {
+        let out = run_claude_stdout(input);
+        assert!(!out.is_empty(), "{context}: hook output is empty");
+        let trimmed = out.trim_end_matches('\n');
+        serde_json::from_str::<Value>(trimmed)
+            .unwrap_or_else(|error| panic!("{context}: invalid JSON {out:?}: {error}"));
+    }
+
+    #[test]
+    fn test_claude_no_opinion_cases_emit_empty_object() {
+        // Claude must receive valid JSON when RTK has no rewrite opinion.
+        let empty_command = json!({
+            "tool_name": "Bash",
+            "tool_input": { "command": "" }
+        })
+        .to_string();
+        let missing_tool_input = json!({ "tool_name": "Bash" }).to_string();
+
+        for (case, input) in [
+            ("unsupported command", claude_input("head -c 100 /etc/hosts")),
+            ("unknown command", claude_input("htop")),
+            ("empty command", empty_command),
+            ("missing tool_input", missing_tool_input),
+            ("empty input", String::new()),
+            ("whitespace input", "   ".to_string()),
+            ("newline-only input", "\n\n".to_string()),
+            ("malformed JSON", "not valid json {{{".to_string()),
+        ] {
+            assert_eq!(
+                run_claude_stdout(&input),
+                "{}\n",
+                "{case} should emit a no-opinion response"
+            );
+        }
+    }
+
+    #[test]
+    fn test_claude_rewrite_still_emits_full_response() {
+        let out = run_claude_stdout(&claude_input("git status"));
+        assert!(out.contains("hookSpecificOutput"));
+        assert!(out.contains("rtk git status"));
+    }
+
+    #[test]
+    fn test_claude_no_rewrite_cases_emit_valid_json() {
+        for command in [
+            "head -c 100 file.txt",
+            "wc -l file.txt",
+            "sed 's/a/b/' file.txt",
+            "yarn test",
+            "npm run build",
+            "htop",
+            "ls -la",
+        ] {
+            assert_emits_valid_json(&claude_input(command), command);
+        }
     }
 
     // --- Codex handler ---
