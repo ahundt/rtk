@@ -54,6 +54,10 @@ fn has_file_operand(args: &[String]) -> bool {
         if arg == "--" {
             return idx + 1 < args.len();
         }
+        if arg == "-" {
+            idx += 1;
+            continue;
+        }
         if takes_separate_value(arg) {
             idx += 2;
             continue;
@@ -262,6 +266,7 @@ mod tests {
             vec!["--lines", "20"],
             vec!["-50"],
             vec!["--lines=20"],
+            vec!["-"],
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
             assert!(reads_from_stdin(&args), "{args:?} should inherit stdin");

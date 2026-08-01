@@ -115,8 +115,7 @@ pub const RULES: &[RtkRule] = &[
         rewrite_prefixes: &["tail"],
         category: "Files",
         savings_pct: 70.0,
-        subcmd_savings: &[],
-        subcmd_status: &[],
+        ..RtkRule::DEFAULT
     },
     RtkRule {
         pattern: r"^grep\s+",
