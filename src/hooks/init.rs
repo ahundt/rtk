@@ -879,14 +879,12 @@ pub fn uninstall(
 
 fn uninstall_codex(global: bool, ctx: InitContext) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
-    if !global {
-        anyhow::bail!(
-            "Uninstall only works with --global flag. For local projects, manually remove RTK from AGENTS.md"
-        );
-    }
-
-    let codex_dir = resolve_codex_dir()?;
-    let removed = uninstall_codex_at(&codex_dir, ctx)?;
+    let removed = if global {
+        let codex_dir = resolve_codex_dir()?;
+        uninstall_codex_at(&codex_dir, ctx)?
+    } else {
+        uninstall_codex_at_paths(Path::new("."), Path::new(CODEX_DIR), ctx)?
+    };
 
     if removed.is_empty() {
         println!("RTK was not installed for Codex CLI (nothing to remove)");
@@ -906,11 +904,19 @@ fn uninstall_codex(global: bool, ctx: InitContext) -> Result<()> {
 }
 
 fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>> {
+    uninstall_codex_at_paths(codex_dir, codex_dir, ctx)
+}
+
+fn uninstall_codex_at_paths(
+    docs_dir: &Path,
+    codex_dir: &Path,
+    ctx: InitContext,
+) -> Result<Vec<String>> {
     let InitContext { verbose, dry_run } = ctx;
     let mut removed = Vec::new();
     let absolute_rtk_md_ref = codex_rtk_md_ref(codex_dir);
 
-    let rtk_md_path = codex_dir.join(RTK_MD);
+    let rtk_md_path = docs_dir.join(RTK_MD);
     if rtk_md_path.exists() {
         if dry_run {
             println!("[dry-run] would remove RTK.md: {}", rtk_md_path.display());
@@ -924,7 +930,7 @@ fn uninstall_codex_at(codex_dir: &Path, ctx: InitContext) -> Result<Vec<String>>
         removed.push(format!("RTK.md: {}", rtk_md_path.display()));
     }
 
-    let agents_md_path = codex_dir.join(AGENTS_MD);
+    let agents_md_path = docs_dir.join(AGENTS_MD);
     if agents_md_path.exists() {
         let content = fs::read_to_string(&agents_md_path)
             .with_context(|| format!("Failed to read AGENTS.md: {}", agents_md_path.display()))?;
@@ -6291,6 +6297,46 @@ mod tests {
         assert!(content.contains("# Team rules"));
         assert!(content.contains("More content"));
         assert!(removed.iter().any(|r| r.contains("rtk-instructions block")));
+    }
+
+    #[test]
+    fn test_local_codex_uninstall_separates_project_docs_from_hooks() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("project");
+        let codex_dir = project_dir.join(CODEX_DIR);
+        let hooks_path = codex::hooks_path(&codex_dir);
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            project_dir.join(AGENTS_MD),
+            format!("# Project rules\n\n{}\n", RTK_MD_REF),
+        )
+        .unwrap();
+        fs::write(project_dir.join(RTK_MD), "local Codex instructions").unwrap();
+        fs::write(
+            &hooks_path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/audit"}]}]}}"#,
+        )
+        .unwrap();
+        codex::install(&hooks_path, InitContext::default()).unwrap();
+
+        let removed =
+            uninstall_codex_at_paths(&project_dir, &codex_dir, InitContext::default()).unwrap();
+
+        assert!(
+            removed.iter().any(|item| item.starts_with("RTK.md: ")),
+            "local RTK.md removal was not reported: {removed:?}"
+        );
+        assert!(!project_dir.join(RTK_MD).exists());
+        let agents = fs::read_to_string(project_dir.join(AGENTS_MD)).unwrap();
+        assert!(!agents.contains(RTK_MD_REF), "local RTK reference remains");
+        let hooks: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(hooks_path).unwrap()).unwrap();
+        let commands = hooks
+            .pointer("/hooks/PreToolUse/0/hooks")
+            .and_then(serde_json::Value::as_array)
+            .unwrap();
+        assert_eq!(commands.len(), 1, "foreign Codex hook was removed");
+        assert_eq!(commands[0]["command"], "/audit");
     }
 
     #[test]
