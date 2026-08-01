@@ -5,7 +5,11 @@ use regex::{Regex, RegexSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use super::lexer::{shell_split, split_on_operators, tokenize, ParsedToken, PipeKind, TokenKind};
+use super::lexer::{
+    contains_compound_boundary_tokens, contains_shell_block, contains_shell_block_tokens,
+    shell_split, split_on_operators, tokenize, tokenize_with_newlines, ParsedToken, PipeKind,
+    TokenKind,
+};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
@@ -241,9 +245,13 @@ fn extract_base_command(cmd: &str) -> &str {
 
 /// Quote-aware heredoc detection — `<<` inside quotes is not a heredoc.
 pub fn has_heredoc(cmd: &str) -> bool {
-    tokenize(cmd)
+    has_heredoc_tokens(&tokenize(cmd))
+}
+
+fn has_heredoc_tokens(tokens: &[ParsedToken]) -> bool {
+    tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Redirect && t.value.starts_with("<<"))
+        .any(|token| token.kind == TokenKind::Redirect && token.value.starts_with("<<"))
 }
 
 pub fn split_command_chain(cmd: &str) -> Vec<&str> {
@@ -253,7 +261,7 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
     }
 
     // Lexer-based for `<<`; string-based for `$((` (lexer splits it across tokens).
-    if has_heredoc(trimmed) || trimmed.contains("$((") {
+    if has_heredoc(trimmed) || contains_shell_block(trimmed) || trimmed.contains("$((") {
         return vec![trimmed];
     }
 
@@ -576,7 +584,11 @@ pub fn rewrite_command(
         return None;
     }
 
-    if has_heredoc(trimmed) || trimmed.contains("$((") {
+    let tokens = tokenize_with_newlines(trimmed);
+    if has_heredoc_tokens(&tokens)
+        || contains_shell_block_tokens(&tokens)
+        || trimmed.contains("$((")
+    {
         return None;
     }
 
@@ -586,16 +598,13 @@ pub fn rewrite_command(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    let has_compound = trimmed.contains("&&")
-        || trimmed.contains("||")
-        || trimmed.contains(';')
-        || trimmed.contains('|')
-        || trimmed.contains(" & ");
-    if !has_compound && (trimmed.starts_with("rtk ") || trimmed == "rtk") {
+    if !contains_compound_boundary_tokens(&tokens)
+        && (trimmed.starts_with("rtk ") || trimmed == "rtk")
+    {
         return Some(trimmed.to_string());
     }
 
-    rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+    rewrite_compound(trimmed, &tokens, &compiled, &normalized_prefixes)
 }
 
 /// Pipeline boundaries used to rewrite its final stage.
@@ -690,10 +699,10 @@ fn rewrite_pipeline_final_stage(
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
 fn rewrite_compound(
     cmd: &str,
+    tokens: &[ParsedToken],
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
 ) -> Option<String> {
-    let tokens = tokenize(cmd);
     let has_pipe = tokens
         .iter()
         .any(|token| matches!(token.kind, TokenKind::Pipe(_)));
@@ -708,7 +717,7 @@ fn rewrite_compound(
     let mut any_changed = false;
     let mut seg_start: usize = 0;
 
-    for tok in &tokens {
+    for tok in tokens {
         if tok.offset < seg_start {
             continue;
         }
@@ -719,6 +728,15 @@ fn rewrite_compound(
                     .unwrap_or_else(|| seg.to_string());
                 if rewritten != seg {
                     any_changed = true;
+                }
+                if matches!(tok.value.as_str(), "\n" | "\r" | "\r\n") {
+                    let raw_segment = &cmd[seg_start..tok.offset];
+                    let indent_len = raw_segment.len() - raw_segment.trim_start().len();
+                    result.push_str(&raw_segment[..indent_len]);
+                    result.push_str(&rewritten);
+                    result.push_str(&tok.value);
+                    seg_start = tok.offset + tok.value.len();
+                    continue;
                 }
                 result.push_str(&rewritten);
                 if tok.value == ";" {
@@ -738,7 +756,7 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe(_) => {
-                let analysis = analyze_pipeline(cmd, &tokens, seg_start, tok.offset);
+                let analysis = analyze_pipeline(cmd, tokens, seg_start, tok.offset);
                 let pipeline = cmd[seg_start..analysis.end_offset].trim();
                 let rewritten_pipeline = rewrite_pipeline_final_stage(
                     cmd,
@@ -3929,6 +3947,69 @@ mod tests {
     fn test_rewrite_compound_all_unsupported_returns_none() {
         // No rewrite at all: returns None
         assert_eq!(rewrite_command_no_prefixes("htop && top", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_top_level_multiline_command_list() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\ngit log", &[]),
+            Some("rtk git status\nrtk git log".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\r\ngit log", &[]),
+            Some("rtk git status\r\nrtk git log".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_long_multiline_command_list_without_truncation() {
+        let command = std::iter::repeat_n("git status", 512)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rewritten = rewrite_command_no_prefixes(&command, &[])
+            .expect("a plain multiline command list should be rewritten");
+
+        assert_eq!(rewritten.matches("rtk git status").count(), 512);
+        assert_eq!(rewritten.matches('\n').count(), 511);
+    }
+
+    #[test]
+    fn test_rewrite_ignores_shell_syntax_in_comments() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status # && cargo test | grep hidden", &[]),
+            Some("rtk git status # && cargo test | grep hidden".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_leaves_control_blocks_unchanged() {
+        for command in [
+            "if git status; then\n  cargo test\nfi",
+            "for file in *.rs; do\n  git log -- \"$file\"\ndone",
+            "case \"$mode\" in\n  fast|safe) git status;;\nesac",
+            "{ git status; cargo test; }",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "control block must remain raw: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_long_control_block_fails_open() {
+        let body = std::iter::repeat_n("  git status\n", 512).collect::<String>();
+        let command = format!("for item in list; do\n{body}done");
+        assert_eq!(rewrite_command_no_prefixes(&command, &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_brace_expansion_as_argument() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git add {one,two}", &[]),
+            Some("rtk git add {one,two}".into())
+        );
     }
 
     // --- sudo / env prefix + rewrite ---
