@@ -295,7 +295,7 @@ pub fn contains_compound_boundary(cmd: &str) -> bool {
 }
 
 fn is_compound_boundary_token(token: &ParsedToken) -> bool {
-    matches!(token.kind, TokenKind::Operator | TokenKind::Pipe)
+    matches!(token.kind, TokenKind::Operator | TokenKind::Pipe(_))
         || (token.kind == TokenKind::Shellism && token.value == "&")
 }
 

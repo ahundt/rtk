@@ -4989,6 +4989,7 @@ mod tests {
             normalize_php_tool_command_with_dirs("./tools/bin/pest", &dirs),
             "pest"
         );
+    }
 
     #[test]
     fn test_already_rtk_fastpath_uses_lexer_boundaries() {
