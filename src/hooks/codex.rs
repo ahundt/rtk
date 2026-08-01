@@ -103,8 +103,16 @@ fn is_rtk_hook(hook: &Value, command: &str) -> bool {
             .is_some_and(|value| {
                 value.strip_prefix(command).is_some_and(|suffix| {
                     suffix.is_empty() || suffix.starts_with(char::is_whitespace)
-                })
+                }) || is_absolute_rtk_hook(value)
             })
+}
+
+fn is_absolute_rtk_hook(command: &str) -> bool {
+    let parts = crate::discover::lexer::shell_split(command);
+    let [binary, hook, event, ..] = parts.as_slice() else {
+        return false;
+    };
+    binary.rsplit(['/', '\\']).next() == Some("rtk") && hook == "hook" && event == "codex"
 }
 
 fn pre_tool_use_mut(root: &mut Value) -> Result<&mut Vec<Value>> {
@@ -323,6 +331,24 @@ mod tests {
             1
         );
         assert!(commands.contains(&"/audit"));
+    }
+
+    #[test]
+    fn upsert_replaces_unmarked_absolute_rtk_command() {
+        let existing = json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "^Bash$",
+                "hooks": [{
+                    "type": "command",
+                    "command": "\"/opt/rtk/bin/rtk\" hook codex"
+                }]
+            }] }
+        })
+        .to_string();
+
+        let (rendered, action) = upsert_json(Some(&existing), CODEX_HOOK_COMMAND).unwrap();
+        assert_eq!(action, HookUpsert::Updated);
+        assert_eq!(commands(&root(&rendered)), vec![CODEX_HOOK_COMMAND]);
     }
 
     #[test]
