@@ -275,10 +275,22 @@ fn copilot_cli_response_from_decision(
 /// Tool names that represent shell command execution in Gemini CLI.
 ///
 /// Covers the Gemini CLI built-in shell tool (`run_shell_command`), the older
-/// `shell` alias, and common MCP integration patterns (`mcp__<server>__run_shell_command`).
+/// `shell` alias, and MCP tools named `mcp_<server>_run_shell_command`.
 /// Without this, MCP-integrated shell tools and the older `shell` name bypass the hook.
 fn is_gemini_shell_tool(name: &str) -> bool {
-    name == "run_shell_command" || name == "shell" || name.ends_with("__run_shell_command")
+    matches!(name, "run_shell_command" | "shell")
+        || name
+            .strip_prefix("mcp_")
+            .and_then(|name| name.strip_suffix("_run_shell_command"))
+            .is_some_and(|server| !server.is_empty())
+}
+
+fn is_gemini_before_tool(input: &Value) -> bool {
+    match input.get("hook_event_name") {
+        None => true,
+        Some(Value::String(event)) => event == "BeforeTool",
+        Some(_) => false,
+    }
 }
 
 /// Run the Gemini CLI BeforeTool hook.
@@ -288,14 +300,21 @@ fn is_gemini_shell_tool(name: &str) -> bool {
 /// matches the safety contract from issue #4669 (failing closed silently disables
 /// the hook from the user's perspective and blocks their work).
 ///
-/// Filters strictly on `hook_event_name == "BeforeTool"` — any other event (e.g.
-/// `AfterTool`, `SessionStart`) returns `"allow"` unchanged.
+/// Filters explicit `hook_event_name` values to `"BeforeTool"`; payloads from
+/// older Gemini integrations that omit the field remain supported. Any other
+/// explicit event (e.g. `AfterTool`, `SessionStart`) returns `"allow"` unchanged.
 ///
 /// On rewrite, the original `tool_input` object is preserved with only the
 /// `command` field replaced, so other fields like `timeout`, `cwd`, `description`
 /// survive the rewrite.
 pub fn run_gemini() -> Result<()> {
-    let input = read_stdin_limited()?;
+    let input = match read_stdin_limited() {
+        Ok(input) => input,
+        Err(_) => {
+            print_allow();
+            return Ok(());
+        }
+    };
 
     // Fail-open on malformed JSON (issue #4669 safety contract).
     let json: Value = match serde_json::from_str(&input) {
@@ -307,11 +326,7 @@ pub fn run_gemini() -> Result<()> {
     };
 
     // BeforeTool event filter — ignore AfterTool, SessionStart, etc.
-    let event = json
-        .get("hook_event_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if event != "BeforeTool" {
+    if !is_gemini_before_tool(&json) {
         print_allow();
         return Ok(());
     }
@@ -346,16 +361,23 @@ pub fn run_gemini() -> Result<()> {
         }
         HookDecision::AskRewrite { ref rewritten, .. } => {
             audit_log("ask", cmd, rewritten);
-            print_gemini("ask_user", Some(rewritten), tool_input);
+            // Gemini supports allow/deny decisions, not an ask decision.
+            // Leave the original command unchanged so Gemini applies its
+            // own confirmation policy.
+            print_allow();
         }
-        HookDecision::Defer => print_gemini("ask_user", None, tool_input),
+        HookDecision::Defer => print_allow(),
     }
 
     Ok(())
 }
 
 fn print_allow() {
-    let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
+    let _ = writeln!(io::stdout(), "{}", gemini_allow_json());
+}
+
+fn gemini_allow_json() -> String {
+    r#"{"decision":"allow"}"#.to_string()
 }
 
 /// Build the Gemini decision JSON, preserving non-`command` fields from
@@ -1691,10 +1713,7 @@ mod tests {
                 r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
             }
             HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r), None),
-            HookDecision::AskRewrite { rewritten: r, .. } => {
-                gemini_json("ask_user", Some(&r), None)
-            }
-            HookDecision::Defer => gemini_json("ask_user", None, None),
+            HookDecision::AskRewrite { .. } | HookDecision::Defer => gemini_allow_json(),
         }
     }
 
@@ -1710,13 +1729,14 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_default_asks_user() {
+    fn test_gemini_default_preserves_native_confirmation() {
         let v: Value = serde_json::from_str(&gemini_render("git status", &[], &[], &[])).unwrap();
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
+        assert!(v.get("hookSpecificOutput").is_none());
     }
 
     #[test]
-    fn test_gemini_substitution_asks_user_without_rewrite() {
+    fn test_gemini_substitution_preserves_native_confirmation() {
         let v: Value = serde_json::from_str(&gemini_render(
             "git status `rm -rf /tmp/x`",
             &[],
@@ -1724,7 +1744,7 @@ mod tests {
             &all_allowed(),
         ))
         .unwrap();
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
         assert!(v.get("hookSpecificOutput").is_none());
     }
 
@@ -1752,13 +1772,14 @@ mod tests {
 
     #[test]
     fn test_is_gemini_shell_tool_matches_only_shell_tools() {
-        // MCP integration: mcp__<server>__run_shell_command should also route
-        // through RTK so MCP-served shell tools don't bypass safety rules.
+        // MCP integration uses mcp_<server>_<tool_name>; the double-underscore
+        // form remains covered because server names may contain underscores.
         let cases = [
             ("run_shell_command", true),
             ("shell", true),
+            ("mcp_rtk_local_run_shell_command", true),
             ("mcp__rtk_local__run_shell_command", true),
-            ("mcp____run_shell_command", true),
+            ("mcp__run_shell_command", false),
             ("read_file", false),
             ("write_file", false),
             ("search_code", false),
@@ -1795,12 +1816,12 @@ mod tests {
 
     #[test]
     fn test_gemini_json_no_rewrite_omits_hook_specific_output() {
-        // ask_user with no rewrite (Defer arm) — must NOT include
+        // No-rewrite responses must use a supported decision and omit
         // hookSpecificOutput, otherwise Gemini may treat the missing
         // tool_input as a directive to clear the command.
-        let out = gemini_json("ask_user", None, Some(&json!({"command": "ls"})));
+        let out = gemini_json("allow", None, Some(&json!({"command": "ls"})));
         let v = parse_gemini_output(&out);
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
         assert!(
             v.get("hookSpecificOutput").is_none(),
             "hookSpecificOutput must be absent when rewrite is None, got: {}",
@@ -1846,11 +1867,25 @@ mod tests {
 
     #[test]
     fn test_gemini_json_decision_values() {
-        // Only "allow", "deny", and "ask_user" are valid Gemini decisions.
-        for val in ["allow", "deny", "ask_user"] {
+        // Gemini's BeforeTool contract supports allow and deny decisions.
+        for val in ["allow", "deny"] {
             let out = gemini_json(val, None, None);
             let v = parse_gemini_output(&out);
             assert_eq!(v["decision"].as_str().unwrap(), val);
+        }
+    }
+
+    #[test]
+    fn test_gemini_event_filter_preserves_legacy_payloads() {
+        let cases = [
+            (json!({}), true),
+            (json!({"hook_event_name": "BeforeTool"}), true),
+            (json!({"hook_event_name": "AfterTool"}), false),
+            (json!({"hook_event_name": 7}), false),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(is_gemini_before_tool(&input), expected, "input: {input}");
         }
     }
 
