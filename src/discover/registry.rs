@@ -1669,6 +1669,31 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_already_rtk_uses_lexer_for_quoted_boundaries() {
+        for command in [
+            r#"rtk git commit -m "Fix && Bug""#,
+            r#"rtk git commit -m "a || b""#,
+            r#"rtk git commit -m "end; here""#,
+            r#"rtk git commit -m "left | right""#,
+            r#"rtk git commit -m "x & y""#,
+            r#"rtk git commit -m 'Fix && Bug'"#,
+            "rtk cargo test 2>&1",
+            "rtk cargo test &>/dev/null",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                Some(command.to_string()),
+                "quoted operators and fd redirects must stay on the simple-command path: {command:?}"
+            );
+        }
+
+        assert_eq!(
+            rewrite_command_no_prefixes("rtk git status && cargo test", &[]),
+            Some("rtk git status && rtk cargo test".into())
+        );
+    }
+
+    #[test]
     fn test_rewrite_background_single_amp() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test & git status", &[]),
