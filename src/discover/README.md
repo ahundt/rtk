@@ -21,7 +21,7 @@ When a hook sends `cargo fmt --all && cargo test 2>&1 | tail -20`:
 → [Arg("cargo"), Arg("test"), Redirect("2>&1"), Operator("&&"), Arg("git"), Arg("status")]
 ```
 
-**Compound splitting** — The rewrite engine walks the tokens, splitting on `Operator` (`&&`, `||`, `;`) and typed `Pipe` tokens (`|`, `|&`). Producers and content-sensitive consumers such as `grep`, `rg`, `tee`, and `xargs` remain byte-for-byte raw. A plain `head`, `tail`, or `cat` tail is accepted only when its arguments read stdin, so safe display-tail commands can retain the producer rewrite without changing output meaning. Stderr pipelines (`|&`) and pipelines containing opaque shell groups remain raw.
+**Compound splitting** — The rewrite engine walks one lexer token stream, splitting on `Operator` (`&&`, `||`, `;`, and newlines) and typed `Pipe` tokens (`|`, `|&`). Producers and content-sensitive consumers such as `grep`, `rg`, `tee`, and `xargs` remain byte-for-byte raw. A plain `head`, `tail`, or `cat` tail is accepted only when its arguments read stdin, so safe display-tail commands can retain the producer rewrite without changing output meaning. Stderr pipelines (`|&`), shell control blocks (`if`, `for`, `case`, and brace groups), and pipelines containing opaque shell groups remain raw.
 
 **Per-segment rewriting** — Each segment goes through:
 

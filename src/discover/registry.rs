@@ -6,8 +6,9 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use super::lexer::{
-    contains_compound_boundary, first_unattestable_construct, split_on_operators, tokenize,
-    tokenize_with_newlines, ParsedToken, PipeKind, TokenKind, UnattestableConstruct,
+    contains_compound_boundary_tokens, contains_shell_block, contains_shell_block_tokens,
+    first_unattestable_construct, split_on_operators, tokenize, tokenize_with_newlines,
+    ParsedToken, PipeKind, TokenKind, UnattestableConstruct,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 use super::suffix::split_rewrite_suffix;
@@ -251,9 +252,13 @@ fn extract_base_command(cmd: &str) -> &str {
 
 /// Quote-aware heredoc detection — `<<` inside quotes is not a heredoc.
 pub fn has_heredoc(cmd: &str) -> bool {
-    tokenize(cmd)
+    has_heredoc_tokens(&tokenize(cmd))
+}
+
+fn has_heredoc_tokens(tokens: &[ParsedToken]) -> bool {
+    tokens
         .iter()
-        .any(|t| t.kind == TokenKind::Redirect && t.value.starts_with("<<"))
+        .any(|token| token.kind == TokenKind::Redirect && token.value.starts_with("<<"))
 }
 
 pub fn split_command_chain(cmd: &str) -> Vec<&str> {
@@ -263,7 +268,7 @@ pub fn split_command_chain(cmd: &str) -> Vec<&str> {
     }
 
     // Lexer-based for `<<`; string-based for `$((` (lexer splits it across tokens).
-    if has_heredoc(trimmed) || trimmed.contains("$((") {
+    if has_heredoc(trimmed) || contains_shell_block(trimmed) || trimmed.contains("$((") {
         return vec![trimmed];
     }
 
@@ -573,7 +578,11 @@ fn rewrite_command_inner(
         return None;
     }
 
-    if has_heredoc(trimmed) || trimmed.contains("$((") {
+    let tokens = tokenize_with_newlines(trimmed);
+    if has_heredoc_tokens(&tokens)
+        || contains_shell_block_tokens(&tokens)
+        || trimmed.contains("$((")
+    {
         return None;
     }
 
@@ -583,11 +592,13 @@ fn rewrite_command_inner(
     // Simple (non-compound) already-RTK command — return as-is.
     // For compound commands that start with "rtk" (e.g. "rtk git add . && cargo test"),
     // fall through to rewrite_compound so the remaining segments get rewritten.
-    if (trimmed.starts_with("rtk ") || trimmed == "rtk") && !contains_compound_boundary(trimmed) {
+    if !contains_compound_boundary_tokens(&tokens)
+        && (trimmed.starts_with("rtk ") || trimmed == "rtk")
+    {
         return Some(trimmed.to_string());
     }
 
-    rewrite_compound(trimmed, &compiled, &normalized_prefixes)
+    rewrite_compound(trimmed, &tokens, &compiled, &normalized_prefixes)
 }
 
 /// Pipeline boundaries used to preserve a complete shell pipeline while
@@ -653,28 +664,35 @@ fn analyze_pipeline(
     }
 }
 
-fn pipe_tail_accepts_filtered_output(pipe_tail: &str) -> bool {
-    let tokens = tokenize(pipe_tail);
-    if tokens.is_empty() {
+fn pipe_tail_accepts_filtered_output(
+    tokens: &[ParsedToken],
+    pipe_offset: usize,
+    end_offset: usize,
+) -> bool {
+    let Some(mut idx) = tokens.iter().position(|token| token.offset == pipe_offset) else {
         return false;
-    }
-
-    let mut idx = 0;
+    };
     let mut saw_stage = false;
-    while idx < tokens.len() {
+    while idx < tokens.len() && tokens[idx].offset < end_offset {
         if tokens[idx].kind != TokenKind::Pipe(PipeKind::Stdout) {
             return false;
         }
         idx += 1;
 
-        if idx >= tokens.len() || tokens[idx].kind != TokenKind::Arg {
+        if idx >= tokens.len()
+            || tokens[idx].offset >= end_offset
+            || tokens[idx].kind != TokenKind::Arg
+        {
             return false;
         }
         let command = strip_absolute_path(&tokens[idx].value);
         idx += 1;
 
         let args_start = idx;
-        while idx < tokens.len() && !matches!(tokens[idx].kind, TokenKind::Pipe(_)) {
+        while idx < tokens.len()
+            && tokens[idx].offset < end_offset
+            && !matches!(tokens[idx].kind, TokenKind::Pipe(_))
+        {
             if tokens[idx].kind != TokenKind::Arg {
                 return false;
             }
@@ -728,10 +746,10 @@ fn is_decimal_count(value: &str) -> bool {
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
 fn rewrite_compound(
     cmd: &str,
+    tokens: &[ParsedToken],
     excluded: &[ExcludePattern],
     transparent_prefixes: &[String],
 ) -> Option<String> {
-    let tokens = tokenize_with_newlines(cmd);
     let has_pipe = tokens
         .iter()
         .any(|token| matches!(token.kind, TokenKind::Pipe(_)));
@@ -746,21 +764,29 @@ fn rewrite_compound(
     let mut any_changed = false;
     let mut seg_start: usize = 0;
 
-    for tok in &tokens {
+    for tok in tokens {
         if tok.offset < seg_start {
             continue;
         }
         match tok.kind {
             TokenKind::Operator => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes);
-                if rewritten.as_deref().is_some_and(|command| command != seg) {
+                let rewritten = rewrite_segment(seg, excluded, transparent_prefixes)
+                    .unwrap_or_else(|| seg.to_string());
+                if rewritten != seg {
                     any_changed = true;
                 }
-                result.push_str(rewritten.as_deref().unwrap_or(seg));
                 if matches!(tok.value.as_str(), "\n" | "\r" | "\r\n") {
+                    let raw_segment = &cmd[seg_start..tok.offset];
+                    let indent_len = raw_segment.len() - raw_segment.trim_start().len();
+                    result.push_str(&raw_segment[..indent_len]);
+                    result.push_str(&rewritten);
                     result.push_str(&tok.value);
-                } else if tok.value == ";" {
+                    seg_start = tok.offset + tok.value.len();
+                    continue;
+                }
+                result.push_str(&rewritten);
+                if tok.value == ";" {
                     result.push(';');
                     let after = tok.offset + tok.value.len();
                     if after < cmd.len() {
@@ -777,11 +803,11 @@ fn rewrite_compound(
                 }
             }
             TokenKind::Pipe(_) => {
-                let analysis = analyze_pipeline(cmd, &tokens, seg_start, tok.offset);
+                let analysis = analyze_pipeline(cmd, tokens, seg_start, tok.offset);
                 let seg = cmd[seg_start..tok.offset].trim();
                 let pipe_tail = cmd[tok.offset..analysis.end_offset].trim();
                 let rewritten = if analysis.final_stage_start.is_some()
-                    && pipe_tail_accepts_filtered_output(pipe_tail)
+                    && pipe_tail_accepts_filtered_output(tokens, tok.offset, analysis.end_offset)
                 {
                     rewrite_segment(seg, excluded, transparent_prefixes)
                 } else {
@@ -1897,10 +1923,17 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_preserves_raw_grep() {
-        assert_eq!(
-            rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            None
-        );
+        for command in [
+            "git log -10 | grep feat",
+            "git log -10 | rg feat",
+            "git log -10 | tee /tmp/log.txt",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "content-sensitive consumer must keep the producer raw: {command}"
+            );
+        }
     }
 
     #[test]
@@ -2015,6 +2048,35 @@ mod tests {
             rewrite_command_no_prefixes("git status # | grep hidden", &[]),
             Some("rtk git status # | grep hidden".into())
         );
+    }
+
+    #[test]
+    fn test_rewrite_preserves_shell_control_blocks() {
+        for command in [
+            "if git status; then\n  cargo test\nfi",
+            "for file in *.rs; do\n  git log -- \"$file\"\ndone",
+            "case \"$mode\" in\n  fast|safe) git status;;\nesac",
+            "{ git status; cargo test; }",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "shell control block must remain raw: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_long_command_list_keeps_every_line() {
+        let command = std::iter::repeat("git status")
+            .take(512)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rewritten = rewrite_command_no_prefixes(&command, &[])
+            .expect("a plain multiline command list should be rewritten");
+
+        assert_eq!(rewritten.matches("rtk git status").count(), 512);
+        assert_eq!(rewritten.matches('\n').count(), 511);
     }
 
     // --- #345: RTK_DISABLED ---
