@@ -2093,8 +2093,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_long_command_list_keeps_every_line() {
-        let command = std::iter::repeat("git status")
-            .take(512)
+        let command = std::iter::repeat_n("git status", 512)
             .collect::<Vec<_>>()
             .join("\n");
         let rewritten = rewrite_command_no_prefixes(&command, &[])
