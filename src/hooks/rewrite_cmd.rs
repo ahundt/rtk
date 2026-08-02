@@ -76,10 +76,9 @@ fn evaluate_with_verdict(
 #[cfg(test)]
 mod tests {
     use super::{evaluate_with_verdict, PermissionVerdict, RewriteOutcome};
-    use crate::discover::registry;
 
     fn rewrite_command_no_prefixes(cmd: &str) -> Option<String> {
-        registry::rewrite_command(cmd, &[], &[])
+        crate::discover::registry::rewrite_command(cmd, &[], &[])
     }
 
     #[test]
@@ -182,6 +181,22 @@ mod tests {
                 RewriteOutcome::Ask("rtk git log > /tmp/out.txt".into())
             );
         }
+
+        #[test]
+        fn test_fd_dup_redirect_still_rewrites() {
+            assert!(matches!(
+                evaluate_default("git status 2>&1"),
+                RewriteOutcome::Ask(_)
+            ));
+        }
+
+        #[test]
+        fn test_plain_command_still_rewrites() {
+            assert!(matches!(
+                evaluate_default("git status"),
+                RewriteOutcome::Ask(_)
+            ));
+        }
     }
 
     /// SECURITY: Verify the exit code protocol for permission verdicts.
@@ -197,7 +212,7 @@ mod tests {
     /// rule would be auto-allowed — bypassing Claude Code's least-privilege default.
     /// See: https://github.com/rtk-ai/rtk/issues/1155
     mod exit_code_protocol {
-        use super::registry;
+        use crate::discover::registry;
         use crate::hooks::permissions::{check_command_with_rules, PermissionVerdict};
 
         /// Exit code that `run()` returns for each verdict:

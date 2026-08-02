@@ -91,6 +91,10 @@ mod tests {
             split("git status > /tmp/status.log"),
             ("git status", " > /tmp/status.log")
         );
+        assert_eq!(
+            split("git status > /tmp/status.log 2>&1"),
+            ("git status", " > /tmp/status.log 2>&1")
+        );
     }
 
     #[test]
@@ -103,11 +107,11 @@ mod tests {
 
     #[test]
     fn keeps_dev_null_and_fd_dup_suffixes() {
+        assert_eq!(split("git status 2>&1"), ("git status", " 2>&1"));
         assert_eq!(
             split("git status > /dev/null 2>&1"),
             ("git status", " > /dev/null 2>&1")
         );
-        assert_eq!(split("git status 2>&1"), ("git status", " 2>&1"));
     }
 
     #[test]
@@ -116,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_strip_pipe_tails() {
+    fn leaves_pipeline_tails_untouched() {
         assert_eq!(
             split("cargo test | tail -50"),
             ("cargo test | tail -50", "")

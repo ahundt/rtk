@@ -1041,7 +1041,8 @@ fn rewrite_segment_inner(
     }
 
     // Strip safe trailing output redirects before matching, then reattach the
-    // original bytes. File targets are classified by the shared permission gate.
+    // original bytes. File targets remain in the core and are classified by the
+    // shared permission gate.
     let suffix = split_rewrite_suffix(trimmed);
     let cmd_part = suffix.core;
     let redirect_suffix = suffix.suffix;
@@ -1956,7 +1957,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_pipe_preserves_raw_grep() {
+    fn test_rewrite_pipe_preserves_raw_consumer() {
         for command in [
             "git log -10 | grep feat",
             "git log -10 | rg feat",
@@ -1965,7 +1966,7 @@ mod tests {
             assert_eq!(
                 rewrite_command_no_prefixes(command, &[]),
                 None,
-                "content-sensitive consumer must keep the producer raw: {command}"
+                "content-sensitive consumer must keep raw producer output: {command}"
             );
         }
     }
@@ -2260,15 +2261,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_redirect_plain_2_devnull() {
-        // 2>/dev/null has no `&`, never broken — non-regression
-        assert_eq!(
-            rewrite_command_no_prefixes("git status 2>/dev/null", &[]),
-            Some("rtk git status 2>/dev/null".into())
-        );
-    }
-
-    #[test]
     fn test_file_redirect_requires_ask_in_any_rewritten_clause() {
         for command in [
             "git status > /tmp/status.log",
@@ -2282,6 +2274,15 @@ mod tests {
                 "file redirect must be ask-only: {command}"
             );
         }
+    }
+
+    #[test]
+    fn test_rewrite_redirect_plain_2_devnull() {
+        // 2>/dev/null has no `&`, never broken — non-regression
+        assert_eq!(
+            rewrite_command_no_prefixes("git status 2>/dev/null", &[]),
+            Some("rtk git status 2>/dev/null".into())
+        );
     }
 
     #[test]
@@ -4060,6 +4061,69 @@ mod tests {
     fn test_rewrite_compound_all_unsupported_returns_none() {
         // No rewrite at all: returns None
         assert_eq!(rewrite_command_no_prefixes("htop && top", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_top_level_multiline_command_list() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\ngit log", &[]),
+            Some("rtk git status\nrtk git log".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git status\r\ngit log", &[]),
+            Some("rtk git status\r\nrtk git log".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_long_multiline_command_list_without_truncation() {
+        let command = std::iter::repeat_n("git status", 512)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rewritten = rewrite_command_no_prefixes(&command, &[])
+            .expect("a plain multiline command list should be rewritten");
+
+        assert_eq!(rewritten.matches("rtk git status").count(), 512);
+        assert_eq!(rewritten.matches('\n').count(), 511);
+    }
+
+    #[test]
+    fn test_rewrite_ignores_shell_syntax_in_comments() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git status # && cargo test | grep hidden", &[]),
+            Some("rtk git status # && cargo test | grep hidden".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_leaves_control_blocks_unchanged() {
+        for command in [
+            "if git status; then\n  cargo test\nfi",
+            "for file in *.rs; do\n  git log -- \"$file\"\ndone",
+            "case \"$mode\" in\n  fast|safe) git status;;\nesac",
+            "{ git status; cargo test; }",
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(command, &[]),
+                None,
+                "control block must remain raw: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_long_control_block_fails_open() {
+        let body = std::iter::repeat_n("  git status\n", 512).collect::<String>();
+        let command = format!("for item in list; do\n{body}done");
+        assert_eq!(rewrite_command_no_prefixes(&command, &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_brace_expansion_as_argument() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git add {one,two}", &[]),
+            Some("rtk git add {one,two}".into())
+        );
     }
 
     // --- sudo / env prefix + rewrite ---

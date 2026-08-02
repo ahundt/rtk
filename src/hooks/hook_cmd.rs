@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_cli_file_redirect_is_ask_only() {
+    fn test_copilot_cli_fd_target_redirect_is_ask_only() {
         let response = end_to_end("git status >& /tmp/evil")
             .expect("file redirect should produce an ask-only rewrite");
         assert_eq!(
@@ -1515,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_cli_plain_file_redirect_is_ask_only() {
+    fn test_copilot_cli_output_redirect_is_ask_only() {
         let response = end_to_end("git status > /tmp/evil")
             .expect("file redirect should produce an ask-only rewrite");
         assert_eq!(
