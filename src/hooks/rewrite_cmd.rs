@@ -47,6 +47,15 @@ enum RewriteOutcome {
 fn evaluate(cmd: &str, excluded: &[String], transparent_prefixes: &[String]) -> RewriteOutcome {
     let verdict = check_command(cmd);
 
+    evaluate_with_verdict(cmd, excluded, transparent_prefixes, verdict)
+}
+
+fn evaluate_with_verdict(
+    cmd: &str,
+    excluded: &[String],
+    transparent_prefixes: &[String],
+    verdict: PermissionVerdict,
+) -> RewriteOutcome {
     if verdict == PermissionVerdict::Deny {
         return RewriteOutcome::Deny;
     }
@@ -91,54 +100,55 @@ mod tests {
     }
 
     mod unattestable_passthrough {
-        use super::super::{evaluate, RewriteOutcome};
+        use super::super::{evaluate_with_verdict, RewriteOutcome};
+        use crate::hooks::permissions::PermissionVerdict;
 
         #[test]
-        fn test_backtick_substitution_passthrough() {
+        fn test_unattestable_constructs_passthrough_under_default_verdict() {
+            for (case, cmd) in [
+                ("backtick substitution", "git status `rm -rf /tmp/x`"),
+                ("dollar substitution", "git status $(rm -rf /tmp/x)"),
+                (
+                    "double-quoted substitution",
+                    "git log --pretty=\"$(rm -rf /tmp/x)\"",
+                ),
+                ("file redirect", "git log > /tmp/out.txt"),
+            ] {
+                assert_eq!(
+                    evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Default),
+                    RewriteOutcome::Passthrough,
+                    "{case} should pass through without consulting local permission files: {cmd}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_default_verdict_still_rewrites_attestable_commands() {
+            for (case, cmd) in [
+                ("plain command", "git status"),
+                ("fd dup redirect", "git status 2>&1"),
+            ] {
+                assert!(
+                    matches!(
+                        evaluate_with_verdict(cmd, &[], &[], PermissionVerdict::Default),
+                        RewriteOutcome::Ask(_)
+                    ),
+                    "{case} should still rewrite with an ask/default verdict: {cmd}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_explicit_deny_still_wins_before_passthrough() {
             assert_eq!(
-                evaluate("git status `rm -rf /tmp/x`", &[], &[]),
-                RewriteOutcome::Passthrough
+                evaluate_with_verdict(
+                    "git status $(rm -rf /tmp/x)",
+                    &[],
+                    &[],
+                    PermissionVerdict::Deny,
+                ),
+                RewriteOutcome::Deny,
             );
-        }
-
-        #[test]
-        fn test_dollar_substitution_passthrough() {
-            assert_eq!(
-                evaluate("git status $(rm -rf /tmp/x)", &[], &[]),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_double_quoted_substitution_passthrough() {
-            assert_eq!(
-                evaluate("git log --pretty=\"$(rm -rf /tmp/x)\"", &[], &[]),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_file_redirect_passthrough() {
-            assert_eq!(
-                evaluate("git log > /tmp/out.txt", &[], &[]),
-                RewriteOutcome::Passthrough
-            );
-        }
-
-        #[test]
-        fn test_fd_dup_redirect_still_rewrites() {
-            assert!(matches!(
-                evaluate("git status 2>&1", &[], &[]),
-                RewriteOutcome::Ask(_)
-            ));
-        }
-
-        #[test]
-        fn test_plain_command_still_rewrites() {
-            assert!(matches!(
-                evaluate("git status", &[], &[]),
-                RewriteOutcome::Ask(_)
-            ));
         }
     }
 
