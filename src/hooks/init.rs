@@ -17,11 +17,12 @@ use crate::hooks::constants::{
 use super::constants::{
     BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND, DROID_DIR,
     DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
-    DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
-    HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR,
-    PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR,
-    VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME, VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
+    DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, GEMINI_SHELL_TOOL_MATCHER,
+    HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE,
+    HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR,
+    PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
+    VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
 };
 use super::integrity;
 use super::is_claude_hook_command;
@@ -4375,19 +4376,23 @@ fn patch_gemini_settings(
     };
 
     let before_tool_pointer = format!("/hooks/{}", BEFORE_TOOL_KEY);
-    if let Some(hooks) = settings.pointer(&before_tool_pointer) {
-        if let Some(arr) = hooks.as_array() {
-            if arr.iter().any(|h| {
-                h.pointer("/hooks/0/command")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|c| c.contains("rtk"))
-            }) {
-                if verbose > 0 {
-                    eprintln!("Gemini settings.json already has RTK hook");
-                }
-                return Ok(());
+    let (has_rtk_hook, matcher_changed) =
+        update_existing_gemini_rtk_matchers(&mut settings, &before_tool_pointer);
+    if has_rtk_hook {
+        if !matcher_changed {
+            if verbose > 0 {
+                eprintln!("Gemini settings.json already has RTK hook");
             }
+            return Ok(());
         }
+        if patch_mode == PatchMode::Skip {
+            println!(
+                "\nManual setup needed: update the RTK hook matcher in {}",
+                settings_path.display()
+            );
+            return Ok(());
+        }
+        return write_gemini_settings(gemini_dir, &settings_path, &settings, verbose, dry_run);
     }
 
     // Ask user before patching
@@ -4420,7 +4425,7 @@ fn patch_gemini_settings(
 
     // Build hook entry matching Gemini CLI format
     let hook_entry = serde_json::json!({
-        "matcher": "run_shell_command",
+        "matcher": GEMINI_SHELL_TOOL_MATCHER,
         "hooks": [{
             "type": "command",
             "command": hook_cmd
@@ -4445,8 +4450,51 @@ fn patch_gemini_settings(
         .context("BeforeTool is not an array")?
         .push(hook_entry);
 
-    let content = serde_json::to_string_pretty(&settings)?;
+    write_gemini_settings(gemini_dir, &settings_path, &settings, verbose, dry_run)
+}
 
+/// Upgrade an existing RTK Gemini entry without touching foreign hook groups.
+fn update_existing_gemini_rtk_matchers(
+    settings: &mut serde_json::Value,
+    before_tool_pointer: &str,
+) -> (bool, bool) {
+    let Some(entries) = settings
+        .pointer_mut(before_tool_pointer)
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return (false, false);
+    };
+
+    let mut found = false;
+    let mut changed = false;
+    for entry in entries {
+        let is_rtk = entry
+            .pointer("/hooks/0/command")
+            .and_then(|value| value.as_str())
+            .is_some_and(|command| command.contains("rtk"));
+        if !is_rtk {
+            continue;
+        }
+
+        found = true;
+        if entry.get("matcher").and_then(|value| value.as_str()) != Some(GEMINI_SHELL_TOOL_MATCHER)
+        {
+            entry["matcher"] = serde_json::json!(GEMINI_SHELL_TOOL_MATCHER);
+            changed = true;
+        }
+    }
+
+    (found, changed)
+}
+
+fn write_gemini_settings(
+    gemini_dir: &Path,
+    settings_path: &Path,
+    settings: &serde_json::Value,
+    verbose: u8,
+    dry_run: bool,
+) -> Result<()> {
+    let content = serde_json::to_string_pretty(settings)?;
     if dry_run {
         println!(
             "[dry-run] would patch Gemini settings.json: {}",
@@ -4458,10 +4506,9 @@ fn patch_gemini_settings(
         return Ok(());
     }
 
-    // Write atomically
     let tmp = NamedTempFile::new_in(gemini_dir)?;
     fs::write(tmp.path(), &content)?;
-    tmp.persist(&settings_path)
+    tmp.persist(settings_path)
         .with_context(|| format!("Failed to write {}", settings_path.display()))?;
 
     if verbose > 0 {
@@ -8610,5 +8657,65 @@ mod tests {
         uninstall_vibe_at(&vibe_dir, InitContext::default()).unwrap();
 
         assert!(!vibe_dir.join(VIBE_HOOKS_FILE).exists());
+    }
+
+    #[test]
+    fn test_gemini_matcher_upgrade_preserves_foreign_entries() {
+        let temp = TempDir::new().unwrap();
+        let settings_path = temp.path().join(SETTINGS_JSON);
+        fs::write(
+            &settings_path,
+            serde_json::json!({
+                "hooks": {
+                    "BeforeTool": [
+                        {
+                            "matcher": "run_shell_command",
+                            "hooks": [{
+                                "type": "command",
+                                "command": "/opt/rtk/bin/rtk hook gemini"
+                            }]
+                        },
+                        {
+                            "matcher": "write_file",
+                            "hooks": [{
+                                "type": "command",
+                                "command": "./check-secrets"
+                            }]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hook_path = temp.path().join("hooks/rtk-gemini-hook");
+        patch_gemini_settings(
+            temp.path(),
+            &hook_path,
+            PatchMode::Auto,
+            InitContext::default(),
+        )
+        .unwrap();
+
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let entries = settings["hooks"]["BeforeTool"].as_array().unwrap();
+        assert_eq!(entries[0]["matcher"], GEMINI_SHELL_TOOL_MATCHER);
+        assert_eq!(entries[1]["matcher"], "write_file");
+
+        let before_second_run = content;
+        patch_gemini_settings(
+            temp.path(),
+            &hook_path,
+            PatchMode::Auto,
+            InitContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(settings_path).unwrap(),
+            before_second_run,
+            "re-running the upgrade must not rewrite the settings"
+        );
     }
 }

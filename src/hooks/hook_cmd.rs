@@ -401,21 +401,74 @@ fn copilot_cli_response_from_decision(
 
 // ── Gemini hook ───────────────────────────────────────────────
 
+/// Tool names that represent shell command execution in Gemini CLI.
+///
+/// Covers the Gemini CLI built-in shell tool (`run_shell_command`), the older
+/// `shell` alias, and MCP tools named `mcp_<server>_run_shell_command`.
+/// Without this, MCP-integrated shell tools and the older `shell` name bypass the hook.
+fn is_gemini_shell_tool(name: &str) -> bool {
+    matches!(name, "run_shell_command" | "shell")
+        || name
+            .strip_prefix("mcp_")
+            .and_then(|name| name.strip_suffix("_run_shell_command"))
+            .is_some_and(|server| !server.is_empty())
+}
+
+fn is_gemini_before_tool(input: &Value) -> bool {
+    match input.get("hook_event_name") {
+        None => true,
+        Some(Value::String(event)) => event == "BeforeTool",
+        Some(_) => false,
+    }
+}
+
 /// Run the Gemini CLI BeforeTool hook.
+///
+/// Fail-open design: malformed JSON, missing `hook_event_name`, or any unexpected
+/// input shape returns an `"allow"` response so the user's command proceeds. This
+/// matches the safety contract from issue #4669 (failing closed silently disables
+/// the hook from the user's perspective and blocks their work).
+///
+/// Filters explicit `hook_event_name` values to `"BeforeTool"`; payloads from
+/// older Gemini integrations that omit the field remain supported. Any other
+/// explicit event (e.g. `AfterTool`, `SessionStart`) returns `"allow"` unchanged.
+///
+/// On rewrite, the original `tool_input` object is preserved with only the
+/// `command` field replaced, so other fields like `timeout`, `cwd`, `description`
+/// survive the rewrite.
 pub fn run_gemini() -> Result<()> {
-    let input = read_stdin_limited()?;
+    let input = match read_stdin_limited() {
+        Ok(input) => input,
+        Err(_) => {
+            print_allow();
+            return Ok(());
+        }
+    };
 
-    let json: Value = serde_json::from_str(&input).context("Failed to parse hook input as JSON")?;
+    // Fail-open on malformed JSON (issue #4669 safety contract).
+    let json: Value = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(_) => {
+            print_allow();
+            return Ok(());
+        }
+    };
 
-    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-
-    if tool_name != "run_shell_command" {
+    // BeforeTool event filter — ignore AfterTool, SessionStart, etc.
+    if !is_gemini_before_tool(&json) {
         print_allow();
         return Ok(());
     }
 
-    let cmd = json
-        .pointer("/tool_input/command")
+    let tool_name = json.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_gemini_shell_tool(tool_name) {
+        print_allow();
+        return Ok(());
+    }
+
+    let tool_input = json.get("tool_input");
+    let cmd = tool_input
+        .and_then(|ti| ti.get("command"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -433,13 +486,16 @@ pub fn run_gemini() -> Result<()> {
         }
         HookDecision::AllowRewrite(ref rewritten) => {
             audit_log("rewrite", cmd, rewritten);
-            print_gemini("allow", Some(rewritten));
+            print_gemini("allow", Some(rewritten), tool_input);
         }
         HookDecision::AskRewrite(ref rewritten) => {
             audit_log("ask", cmd, rewritten);
-            print_gemini("ask_user", Some(rewritten));
+            // Gemini supports allow/deny decisions, not an ask decision.
+            // Leave the original command unchanged so Gemini applies its
+            // own confirmation policy.
+            print_allow();
         }
-        HookDecision::Defer => print_gemini("ask_user", None),
+        HookDecision::Defer => print_allow(),
     }
 
     Ok(())
@@ -508,19 +564,41 @@ fn vibe_rewrite_json(rewritten: &str) -> String {
 }
 
 fn print_allow() {
-    let _ = writeln!(io::stdout(), r#"{{"decision":"allow"}}"#);
+    let _ = writeln!(io::stdout(), "{}", gemini_allow_json());
 }
 
-fn gemini_json(decision: &str, rewrite: Option<&str>) -> String {
-    let mut output = serde_json::json!({ "decision": decision });
+fn gemini_allow_json() -> String {
+    r#"{"decision":"allow"}"#.to_string()
+}
+
+/// Build the Gemini decision JSON, preserving non-`command` fields from
+/// `original_tool_input` when a rewrite is being emitted (so `timeout`, `cwd`,
+/// `description`, etc. survive the rewrite).
+fn gemini_json(
+    decision: &str,
+    rewrite: Option<&str>,
+    original_tool_input: Option<&Value>,
+) -> String {
+    let mut output = json!({ "decision": decision });
     if let Some(cmd) = rewrite {
-        output["hookSpecificOutput"] = serde_json::json!({ "tool_input": { "command": cmd } });
+        let mut new_input = match original_tool_input {
+            Some(v) if v.is_object() => v.clone(),
+            _ => json!({}),
+        };
+        if let Some(obj) = new_input.as_object_mut() {
+            obj.insert("command".into(), Value::String(cmd.to_string()));
+        }
+        output["hookSpecificOutput"] = json!({ "tool_input": new_input });
     }
     output.to_string()
 }
 
-fn print_gemini(decision: &str, rewrite: Option<&str>) {
-    let _ = writeln!(io::stdout(), "{}", gemini_json(decision, rewrite));
+fn print_gemini(decision: &str, rewrite: Option<&str>, original_tool_input: Option<&Value>) {
+    let _ = writeln!(
+        io::stdout(),
+        "{}",
+        gemini_json(decision, rewrite, original_tool_input)
+    );
 }
 
 // ── Audit logging ─────────────────────────────────────────────
@@ -2395,9 +2473,8 @@ mod tests {
             HookDecision::Deny => {
                 r#"{"decision":"deny","reason":"Blocked by RTK permission rule"}"#.to_string()
             }
-            HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r)),
-            HookDecision::AskRewrite(r) => gemini_json("ask_user", Some(&r)),
-            HookDecision::Defer => gemini_json("ask_user", None),
+            HookDecision::AllowRewrite(r) => gemini_json("allow", Some(&r), None),
+            HookDecision::AskRewrite(_) | HookDecision::Defer => gemini_allow_json(),
         }
     }
 
@@ -2413,13 +2490,14 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_default_asks_user() {
+    fn test_gemini_default_preserves_native_confirmation() {
         let v: Value = serde_json::from_str(&gemini_render("git status", &[], &[], &[])).unwrap();
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
+        assert!(v.get("hookSpecificOutput").is_none());
     }
 
     #[test]
-    fn test_gemini_substitution_asks_user_without_rewrite() {
+    fn test_gemini_substitution_preserves_native_confirmation() {
         let v: Value = serde_json::from_str(&gemini_render(
             "git status `rm -rf /tmp/x`",
             &[],
@@ -2427,7 +2505,7 @@ mod tests {
             &all_allowed(),
         ))
         .unwrap();
-        assert_eq!(v["decision"], "ask_user");
+        assert_eq!(v["decision"], "allow");
         assert!(v.get("hookSpecificOutput").is_none());
     }
 
@@ -2441,6 +2519,135 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(v["decision"], "deny");
+    }
+
+    // ── Gemini robustness tests ─────────────────────────────────────────
+    //
+    // These tests cover fail-open malformed input, BeforeTool filtering,
+    // shell-tool matching including MCP patterns, and tool_input field
+    // preservation on rewrite.
+
+    fn parse_gemini_output(output: &str) -> Value {
+        serde_json::from_str(output).unwrap()
+    }
+
+    #[test]
+    fn test_is_gemini_shell_tool_matches_only_shell_tools() {
+        // MCP integration uses mcp_<server>_<tool_name>; the double-underscore
+        // form remains covered because server names may contain underscores.
+        let cases = [
+            ("run_shell_command", true),
+            ("shell", true),
+            ("mcp_rtk_local_run_shell_command", true),
+            ("mcp__rtk_local__run_shell_command", true),
+            ("mcp__run_shell_command", false),
+            ("read_file", false),
+            ("write_file", false),
+            ("search_code", false),
+            ("list_directory", false),
+            ("", false),
+        ];
+
+        for (tool_name, expected) in cases {
+            assert_eq!(
+                is_gemini_shell_tool(tool_name),
+                expected,
+                "tool match for {tool_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemini_json_preserves_other_tool_input_fields() {
+        let original = json!({
+            "command": "git status",
+            "timeout": 30,
+            "cwd": "/project"
+        });
+        let out = gemini_json("allow", Some("rtk git status"), Some(&original));
+        let v = parse_gemini_output(&out);
+        assert_eq!(v["decision"], "allow");
+        let ti = &v["hookSpecificOutput"]["tool_input"];
+        assert_eq!(ti["command"], "rtk git status");
+        assert_eq!(ti["timeout"], 30);
+        assert_eq!(ti["cwd"], "/project");
+        assert!(v.get("modified_input").is_none());
+        assert!(v.get("modifiedArgs").is_none());
+    }
+
+    #[test]
+    fn test_gemini_json_no_rewrite_omits_hook_specific_output() {
+        // No-rewrite responses must use a supported decision and omit
+        // hookSpecificOutput, otherwise Gemini may treat the missing
+        // tool_input as a directive to clear the command.
+        let out = gemini_json("allow", None, Some(&json!({"command": "ls"})));
+        let v = parse_gemini_output(&out);
+        assert_eq!(v["decision"], "allow");
+        assert!(
+            v.get("hookSpecificOutput").is_none(),
+            "hookSpecificOutput must be absent when rewrite is None, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_gemini_json_rewrite_builds_tool_input_object_defensively() {
+        // Defensive: if upstream caller passes None for original_tool_input
+        // or a non-object tool_input arrives with a rewrite, build an object
+        // containing only command.
+        let non_object = json!("not-an-object");
+        for original_tool_input in [None, Some(&non_object)] {
+            let out = gemini_json("allow", Some("rtk git status"), original_tool_input);
+            let v = parse_gemini_output(&out);
+            assert_eq!(
+                v["hookSpecificOutput"]["tool_input"]["command"],
+                "rtk git status"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemini_json_uses_decision_field_name() {
+        // Wire format conformance: Gemini expects "decision", not "result".
+        let out = gemini_json("allow", None, None);
+        let v = parse_gemini_output(&out);
+        assert!(v.get("decision").is_some(), "must have 'decision' field");
+        assert!(v.get("result").is_none(), "must NOT have 'result' field");
+    }
+
+    #[test]
+    fn test_gemini_json_uses_hookspecificoutput_field_name() {
+        // Wire format conformance: Gemini expects "hookSpecificOutput", not
+        // "modified_input" or "modifiedArgs".
+        let out = gemini_json("allow", Some("rtk ls"), Some(&json!({"command": "ls"})));
+        let v = parse_gemini_output(&out);
+        assert!(v.get("hookSpecificOutput").is_some());
+        assert!(v.get("modified_input").is_none());
+        assert!(v.get("modifiedArgs").is_none());
+    }
+
+    #[test]
+    fn test_gemini_json_decision_values() {
+        // Gemini's BeforeTool contract supports allow and deny decisions.
+        for val in ["allow", "deny"] {
+            let out = gemini_json(val, None, None);
+            let v = parse_gemini_output(&out);
+            assert_eq!(v["decision"].as_str().unwrap(), val);
+        }
+    }
+
+    #[test]
+    fn test_gemini_event_filter_preserves_legacy_payloads() {
+        let cases = [
+            (json!({}), true),
+            (json!({"hook_event_name": "BeforeTool"}), true),
+            (json!({"hook_event_name": "AfterTool"}), false),
+            (json!({"hook_event_name": 7}), false),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(is_gemini_before_tool(&input), expected, "input: {input}");
+        }
     }
 
     // --- Factory Droid hook ---
